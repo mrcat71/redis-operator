@@ -770,6 +770,10 @@ fi`, redisCLIAuthSanitizer, tlsArgs, tlsArgs, tlsArgs, demotionWaitLoop(tlsArgs,
 // failover: SENTINEL FAILOVER replies -NOGOODSLAVE when no replica is eligible
 // and -INPROGRESS when one is already running, and in neither case does waiting
 // for this node's demotion achieve anything.
+//
+// With TLS the embedded Sentinel only listens on TLS and requires a client
+// certificate, so the SENTINEL FAILOVER call carries the same TLS arguments as
+// the local calls; without them it fails and the hook never fails over.
 func generateReplicationPreStop(tlsArgs string, cfg PreStopConfig) string {
 	sentinelPort := cfg.SentinelPort
 	if sentinelPort == 0 {
@@ -781,7 +785,7 @@ func generateReplicationPreStop(tlsArgs string, cfg PreStopConfig) string {
 ROLE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s info replication | awk -F: '/role:master/ {print "master"}')
 
 if [ "$ROLE" = "master" ]; then
-    FAILOVER_RESULT=$(redis-cli -h "%s" -p %d SENTINEL FAILOVER %s 2>&1)
+    FAILOVER_RESULT=$(redis-cli -h "%s" -p %d%s SENTINEL FAILOVER %s 2>&1)
     case "$FAILOVER_RESULT" in
         OK*) ;;
         *)
@@ -792,7 +796,7 @@ if [ "$ROLE" = "master" ]; then
     esac
 
     %s
-fi`, redisCLIAuthSanitizer, tlsArgs, cfg.SentinelService, sentinelPort, cfg.SentinelMasterName, demotionWaitLoop(tlsArgs, waitSeconds, "    "))
+fi`, redisCLIAuthSanitizer, tlsArgs, cfg.SentinelService, sentinelPort, tlsArgs, cfg.SentinelMasterName, demotionWaitLoop(tlsArgs, waitSeconds, "    "))
 }
 
 func generateInitContainerDef(role, name string, initcontainerParams initContainerParameters, externalConfig *string, mountpath []corev1.VolumeMount, containerParams containerParameters, clusterVersion *string) []corev1.Container {
