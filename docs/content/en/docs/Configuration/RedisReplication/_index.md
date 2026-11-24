@@ -161,6 +161,21 @@ spec:
       key: password
 ```
 
+## Planned Failover with the Embedded Sentinel
+
+When the master pod is deleted, drained or rolled, its preStop hook hands the master role to a replica without losing acknowledged writes:
+
+1. `CLIENT PAUSE WRITE` stops the master from accepting writes. Clients wait instead of receiving errors.
+2. The hook waits until every connected replica has acknowledged the master's replication offset, for at most half of the hook's time budget.
+3. `SENTINEL FAILOVER` promotes a replica.
+4. As soon as Sentinel reports the new master, the old master runs `REPLICAOF` to replicate from it and lifts the pause. The writes that were waiting fail with `READONLY` instead of being accepted by the old master and lost when it resyncs.
+
+If a replica has not caught up when the wait ends, the hook fails over anyway: writes are still paused, so it loses only what that replica lacks at that moment. Skipping would let the old master acknowledge more writes until it shuts down, and Sentinel would then promote the same replica after `downAfterMilliseconds`. The hook does nothing when the pod is not the master Sentinel monitors, and with Redis older than 6.2, which has no `CLIENT PAUSE WRITE`, it fails over without the pause.
+
+The hook runs for at most `terminationGracePeriodSeconds` minus 10 seconds (20 seconds with the default grace period of 30), and the pause is set to expire at that deadline, so a pod is never left paused. The hook authenticates to Sentinel with the Redis password, so it needs `spec.sentinel.redisSecret` to hold the same password as `kubernetesConfig.redisSecret`, or to be unset. With a different Sentinel password Sentinel refuses the hook's commands, so the hook skips the handoff and Sentinel fails over only after the master has stopped.
+
+The `<name>-master` Service selects the pod labelled `redis-role=master`. The operator moves that label to the pod a quorum of ready Sentinels names as master as soon as that pod answers as a master, even while a StatefulSet is not ready, for example while a pod on a lost node is stuck `Terminating`. It rechecks every 5 seconds until both StatefulSets are ready and every Redis pod answers. Replication itself is reconfigured only once both StatefulSets are ready again.
+
 ## ACL Configuration
 
 Enabling `spec.acl` (either `acl.secret` or `acl.persistentVolumeClaim`) makes Redis load users from the ACL file via the `aclfile` directive. Once `aclfile` is set, the ACL file is the sole authority on users: `requirepass` is ignored, and when the file does not define `default`, Redis creates a `default` user without a password.
