@@ -489,8 +489,8 @@ func generateContainerDef(name string, containerParams containerParameters, clus
 				containerParams.Resources,
 				containerParams.MaxMemoryPercentOfLimit,
 			),
-			ReadinessProbe: getProbeInfo(containerParams.ReadinessProbe, sentinelCntr, enableTLS),
-			LivenessProbe:  getProbeInfo(containerParams.LivenessProbe, sentinelCntr, enableTLS),
+			ReadinessProbe: GetProbeInfo(containerParams.ReadinessProbe, sentinelCntr, enableTLS),
+			LivenessProbe:  GetProbeInfo(containerParams.LivenessProbe, sentinelCntr, enableTLS),
 			VolumeMounts:   getVolumeMount(name, containerParams.PersistenceEnabled, clusterMode, nodeConfVolume, externalConfig, mountpath, containerParams.TLSConfig, containerParams.ACLConfig),
 		},
 	}
@@ -910,13 +910,15 @@ func GenerateTLSEnvironmentVariables(tlsconfig *commonapi.TLSConfig) []corev1.En
 // entrypoint (entrypoint-sentinel.sh). That entrypoint reads the CA path from
 // REDIS_TLS_CA_KEY, not REDIS_TLS_CA_CERT, and always writes it to
 // tls-ca-cert-file, so the CA is set even without an explicit tlsConfig.CaCertFile:
-// Sentinel cannot verify Redis or its peers over TLS without one.
+// Sentinel cannot verify Redis or its peers over TLS without one. The same
+// path is also exported as REDIS_TLS_CA_CERT, which the GetProbeInfo probes read.
 func GenerateSentinelTLSEnvironmentVariables(tlsconfig *commonapi.TLSConfig) []corev1.EnvVar {
 	root := "/tls/"
 	caCert, tlsCert, tlsCertKey := getTLSSecretKeys(tlsconfig)
 	return []corev1.EnvVar{
 		{Name: "TLS_MODE", Value: "true"},
 		{Name: "REDIS_TLS_CA_KEY", Value: path.Join(root, caCert)},
+		{Name: "REDIS_TLS_CA_CERT", Value: path.Join(root, caCert)},
 		{Name: "REDIS_TLS_CERT", Value: path.Join(root, tlsCert)},
 		{Name: "REDIS_TLS_CERT_KEY", Value: path.Join(root, tlsCertKey)},
 	}
@@ -1075,10 +1077,13 @@ func generateACLVolumeMount(aclConfig *commonapi.ACLConfig, readOnly bool) *core
 	}
 }
 
-// getProbeInfo generate probe for Redis StatefulSet
+// GetProbeInfo generate probe for Redis StatefulSet
 // The `ping` command will exit successfully even if the node is loading,
 // so we need to verify that the Redis `ping` command returns "PONG".
-func getProbeInfo(probe *corev1.Probe, sentinel, enableTLS bool) *corev1.Probe {
+// The rendered command reads REDIS_PORT or SENTINEL_PORT, REDISCLI_AUTH and,
+// with TLS, REDIS_TLS_CERT, REDIS_TLS_CERT_KEY and REDIS_TLS_CA_CERT from the
+// container environment.
+func GetProbeInfo(probe *corev1.Probe, sentinel, enableTLS bool) *corev1.Probe {
 	if probe == nil {
 		probe = &corev1.Probe{}
 	}

@@ -161,6 +161,10 @@ spec:
       key: password
 ```
 
+## Embedded Sentinel Probes
+
+The Sentinel container has readiness and liveness probes that run `redis-cli PING` against port 26379 and expect `PONG`, authenticating with `spec.sentinel.redisSecret` when it is set and using TLS when `spec.TLS` is set. A Sentinel pod is ready only once it answers. The operator waits for all Sentinel pods to be ready before configuring replication and asks only ready Sentinels which master they monitor.
+
 ## Embedded Sentinel TLS
 
 When `spec.TLS` is set, the embedded Sentinel uses the same TLS secret as the Redis pods:

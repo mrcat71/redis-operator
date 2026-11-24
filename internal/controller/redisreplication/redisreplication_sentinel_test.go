@@ -158,6 +158,56 @@ func TestBuildSentinelContainer(t *testing.T) {
 	assert.Equal(t, int32(26379), container.Ports[0].ContainerPort)
 }
 
+func TestBuildSentinelContainerProbes(t *testing.T) {
+	const sanitizer = `if [ -n "${REDISCLI_AUTH:-}" ]; then REDISCLI_AUTH="$(printf %s "$REDISCLI_AUTH" | tr -d '\r\n')"; export REDISCLI_AUTH; fi`
+	tests := []struct {
+		name string
+		tls  *commonapi.TLSConfig
+		want string
+	}{
+		{
+			name: "without TLS",
+			want: sanitizer + "\n" +
+				`RESP="$(redis-cli -h $(hostname) -p ${SENTINEL_PORT} ping)"` + "\n" +
+				`[ "$RESP" = "PONG" ]`,
+		},
+		{
+			name: "with TLS",
+			tls:  &commonapi.TLSConfig{Secret: corev1.SecretVolumeSource{SecretName: "redis-tls-cert"}},
+			want: sanitizer + "\n" +
+				`RESP="$(redis-cli -h $(hostname) -p ${SENTINEL_PORT} --tls --cert ${REDIS_TLS_CERT} --key ${REDIS_TLS_CERT_KEY} ${REDIS_TLS_CA_CERT:+--cacert} ${REDIS_TLS_CA_CERT} ping)"` + "\n" +
+				`[ "$RESP" = "PONG" ]`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rr := &rrvb2.RedisReplication{
+				Spec: rrvb2.RedisReplicationSpec{TLS: tt.tls, Sentinel: &rrvb2.Sentinel{Size: 3}},
+			}
+
+			container := buildSentinelContainer(rr)
+
+			for name, probe := range map[string]*corev1.Probe{"readiness": container.ReadinessProbe, "liveness": container.LivenessProbe} {
+				require.NotNil(t, probe, name)
+				require.NotNil(t, probe.Exec, name)
+				assert.Equal(t, []string{"sh", "-ec", tt.want}, probe.Exec.Command, name)
+			}
+			assert.NotSame(t, container.ReadinessProbe, container.LivenessProbe)
+			// Every variable the probe reads is set on the container.
+			names := map[string]bool{}
+			for _, env := range container.Env {
+				names[env.Name] = true
+			}
+			assert.True(t, names["SENTINEL_PORT"])
+			if tt.tls != nil {
+				for _, name := range []string{"REDIS_TLS_CERT", "REDIS_TLS_CERT_KEY", "REDIS_TLS_CA_CERT"} {
+					assert.True(t, names[name], name)
+				}
+			}
+		})
+	}
+}
+
 func TestBuildSentinelEnv(t *testing.T) {
 	redisSecret := &commonapi.ExistingPasswordSecret{
 		Name: ptr.To("redis-secret"),
@@ -188,9 +238,9 @@ func TestBuildSentinelEnv(t *testing.T) {
 		return "", false
 	}
 
-	t.Run("no password secret sets quorum and the hostname knobs", func(t *testing.T) {
+	t.Run("no password secret sets quorum, the hostname knobs and the probe port", func(t *testing.T) {
 		envs := buildSentinelEnv(newRR(nil, nil))
-		require.Len(t, envs, 3)
+		require.Len(t, envs, 4)
 		assert.Equal(t, "QUORUM", envs[0].Name)
 		assert.Equal(t, "2", envs[0].Value) // size 3 -> 3/2+1
 		// Without these the embedded Sentinel always rendered `resolve-hostnames no`
@@ -201,6 +251,11 @@ func TestBuildSentinelEnv(t *testing.T) {
 		v, ok = envValue(envs, "ANNOUNCE_HOSTNAMES")
 		require.True(t, ok, "ANNOUNCE_HOSTNAMES must be passed to the embedded Sentinel")
 		assert.Equal(t, "no", v)
+		v, ok = envValue(envs, "SENTINEL_PORT")
+		require.True(t, ok, "SENTINEL_PORT is read by the probes")
+		assert.Equal(t, "26379", v)
+		_, ok = envValue(envs, "REDISCLI_AUTH")
+		assert.False(t, ok, "REDISCLI_AUTH must stay unset without a sentinel password")
 	})
 
 	t.Run("hostname knobs are propagated from the spec", func(t *testing.T) {
@@ -225,6 +280,8 @@ func TestBuildSentinelEnv(t *testing.T) {
 		envs := buildSentinelEnv(newRR(redisSecret, sentinelSecret))
 		assertSecretEnv(t, envs, "MASTER_PASSWORD", "redis-secret", "redis-password")
 		assertSecretEnv(t, envs, "REDIS_PASSWORD", "sentinel-secret", "sentinel-password")
+		// The probes authenticate to Sentinel, not to Redis.
+		assertSecretEnv(t, envs, "REDISCLI_AUTH", "sentinel-secret", "sentinel-password")
 	})
 
 	t.Run("sentinel-only redisSecret leaves the master unauthenticated", func(t *testing.T) {
@@ -386,6 +443,7 @@ func TestBuildSentinelPodTemplateTLS(t *testing.T) {
 			wantTLSEnv: map[string]string{
 				"TLS_MODE":           "true",
 				"REDIS_TLS_CA_KEY":   "/tls/ca.crt",
+				"REDIS_TLS_CA_CERT":  "/tls/ca.crt",
 				"REDIS_TLS_CERT":     "/tls/tls.crt",
 				"REDIS_TLS_CERT_KEY": "/tls/tls.key",
 			},
@@ -411,6 +469,7 @@ func TestBuildSentinelPodTemplateTLS(t *testing.T) {
 			wantTLSEnv: map[string]string{
 				"TLS_MODE":           "true",
 				"REDIS_TLS_CA_KEY":   "/tls/root.pem",
+				"REDIS_TLS_CA_CERT":  "/tls/root.pem",
 				"REDIS_TLS_CERT":     "/tls/server.pem",
 				"REDIS_TLS_CERT_KEY": "/tls/server-key.pem",
 			},

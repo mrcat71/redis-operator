@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
@@ -185,6 +186,11 @@ func buildSentinelContainer(rr *rrvb2.RedisReplication) corev1.Container {
 			},
 		},
 		Env: buildSentinelEnv(rr),
+		// The same redis-cli PING probe the operator renders for its other
+		// pods. Readiness gates the operator: it waits for the Sentinel
+		// StatefulSet to be ready and only asks ready Sentinels for the master.
+		ReadinessProbe: k8sutils.GetProbeInfo(nil, true, rr.Spec.TLS != nil),
+		LivenessProbe:  k8sutils.GetProbeInfo(nil, true, rr.Spec.TLS != nil),
 	}
 	if rr.Spec.Sentinel.Resources != nil {
 		container.Resources = *rr.Spec.Sentinel.Resources
@@ -209,12 +215,17 @@ func buildSentinelEnv(rr *rrvb2.RedisReplication) []corev1.EnvVar {
 		{Name: "QUORUM", Value: fmt.Sprintf("%d", rr.Spec.Sentinel.Size/2+1)},
 		{Name: "RESOLVE_HOSTNAMES", Value: resolveHostnamesOrDefault(rr.Spec.Sentinel.ResolveHostnames)},
 		{Name: "ANNOUNCE_HOSTNAMES", Value: resolveHostnamesOrDefault(rr.Spec.Sentinel.AnnounceHostnames)},
+		// Read by the probes. The image defaults to the same port; setting it
+		// keeps the probes correct with images that do not.
+		{Name: "SENTINEL_PORT", Value: strconv.Itoa(common.SentinelPort)},
 	}
 	if secret := rr.Spec.KubernetesConfig.ExistingPasswordSecret; secret != nil {
 		envs = append(envs, secretEnvVar("MASTER_PASSWORD", secret))
 	}
 	if secret := rr.Spec.Sentinel.ExistingPasswordSecret; secret != nil {
-		envs = append(envs, secretEnvVar("REDIS_PASSWORD", secret))
+		// REDISCLI_AUTH lets the probes authenticate without a password on
+		// the command line, as on the Redis pods.
+		envs = append(envs, secretEnvVar("REDIS_PASSWORD", secret), secretEnvVar("REDISCLI_AUTH", secret))
 	}
 	if rr.Spec.TLS != nil {
 		envs = append(envs, k8sutils.GenerateSentinelTLSEnvironmentVariables(rr.Spec.TLS)...)

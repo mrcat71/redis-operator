@@ -1731,6 +1731,7 @@ func TestGenerateSentinelTLSEnvironmentVariables(t *testing.T) {
 			want: []corev1.EnvVar{
 				{Name: "TLS_MODE", Value: "true"},
 				{Name: "REDIS_TLS_CA_KEY", Value: "/tls/test_ca.crt"},
+				{Name: "REDIS_TLS_CA_CERT", Value: "/tls/test_ca.crt"},
 				{Name: "REDIS_TLS_CERT", Value: "/tls/test_tls.crt"},
 				{Name: "REDIS_TLS_CERT_KEY", Value: "/tls/test_tls.key"},
 			},
@@ -1743,6 +1744,7 @@ func TestGenerateSentinelTLSEnvironmentVariables(t *testing.T) {
 			want: []corev1.EnvVar{
 				{Name: "TLS_MODE", Value: "true"},
 				{Name: "REDIS_TLS_CA_KEY", Value: "/tls/ca.crt"},
+				{Name: "REDIS_TLS_CA_CERT", Value: "/tls/ca.crt"},
 				{Name: "REDIS_TLS_CERT", Value: "/tls/tls.crt"},
 				{Name: "REDIS_TLS_CERT_KEY", Value: "/tls/tls.key"},
 			},
