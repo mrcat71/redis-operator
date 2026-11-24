@@ -416,15 +416,19 @@ func (r *Reconciler) configureSentinelPod(
 		}
 	}
 
-	if err := r.sentinelResetIfNeed(ctx, inst, sentinelService); err != nil {
+	if err := r.sentinelResetIfNeed(ctx, inst, sentinelPod.Name, sentinelService); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (r *Reconciler) sentinelResetIfNeed(ctx context.Context, inst *rrvb2.RedisReplication, redisService redis.Service) error {
-	logger := log.FromContext(ctx)
+// sentinelResetIfNeed resets the master group on one Sentinel when it knows
+// more replicas or Sentinels than the spec allows. Each Sentinel keeps its own
+// lists, so the log names the pod: a Sentinel that reports stale entries again
+// after a reset is relearning them from the master's INFO replication.
+func (r *Reconciler) sentinelResetIfNeed(ctx context.Context, inst *rrvb2.RedisReplication, sentinelPod string, redisService redis.Service) error {
+	logger := log.FromContext(ctx).WithValues("sentinelPod", sentinelPod)
 
 	sentinelInfo, err := redisService.GetInfoSentinel(ctx)
 	if err != nil {
