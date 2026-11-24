@@ -631,14 +631,17 @@ func TestReconcileStatusKeepsLastKnownMasterWhenOnlyAStandaloneMasterIsObserved(
 	tests := []struct {
 		name     string
 		instance func() *rrvb2.RedisReplication
+		// With the embedded Sentinel an incomplete topology is rechecked soon.
+		wantResult ctrl.Result
 	}{
 		{
 			name:     "without sentinel the standalone pod is not the recorded master",
 			instance: newReplicationInstanceForTest,
 		},
 		{
-			name:     "with sentinel the standalone pod is not the monitored master",
-			instance: newSentinelReplicationInstanceForTest,
+			name:       "with sentinel the standalone pod is not the monitored master",
+			instance:   newSentinelReplicationInstanceForTest,
+			wantResult: ctrl.Result{Requeue: true, RequeueAfter: sentinelIncompleteRequeue},
 		},
 	}
 
@@ -673,7 +676,7 @@ func TestReconcileStatusKeepsLastKnownMasterWhenOnlyAStandaloneMasterIsObserved(
 			result, err := r.reconcileStatus(context.Background(), instance)
 
 			require.NoError(t, err)
-			assert.Equal(t, ctrl.Result{}, result)
+			assert.Equal(t, tt.wantResult, result)
 			assert.True(t, healer.updateCalled)
 			// The kept Status.MasterNode is a fallback, not an identification; the
 			// healer must not take it as proof against other master labels.
@@ -684,6 +687,202 @@ func TestReconcileStatusKeepsLastKnownMasterWhenOnlyAStandaloneMasterIsObserved(
 			assert.Equal(t, "example-replication-0", updated.Status.MasterNode)
 		})
 	}
+}
+
+// The node of the master was lost: its pod stays Terminating, so a StatefulSet
+// never becomes ready, and Sentinel has promoted the replica. The master
+// Service follows the redis-role label, so the label must move to the pod a
+// quorum of Sentinels names even though replication is not reconfigured.
+func TestReconcileRedisFollowsSentinelMasterWhileAStatefulSetIsNotReady(t *testing.T) {
+	const (
+		lost     = "example-replication-0"
+		promoted = "example-replication-1"
+	)
+	waitingRequeue := ctrl.Result{Requeue: true, RequeueAfter: sentinelIncompleteRequeue}
+	tests := []struct {
+		name       string
+		notReady   []string
+		masters    []string
+		monitored  func(context.Context, *rrvb2.RedisReplication, []string) (string, error)
+		wantMaster string
+		wantLabel  bool
+	}{
+		{
+			name:       "redis statefulset not ready, sentinel names the promoted pod",
+			notReady:   []string{"example-replication"},
+			masters:    []string{promoted},
+			monitored:  sentinelMonitoring(promoted),
+			wantMaster: promoted,
+			wantLabel:  true,
+		},
+		{
+			// The lost node can take a Sentinel pod with it.
+			name:       "sentinel statefulset not ready, a quorum of the ready sentinels names the promoted pod",
+			notReady:   []string{"example-replication-s"},
+			masters:    []string{promoted},
+			monitored:  sentinelMonitoring(promoted),
+			wantMaster: promoted,
+			wantLabel:  true,
+		},
+		{
+			name:       "no quorum leaves the label and the recorded master alone",
+			notReady:   []string{"example-replication"},
+			masters:    []string{promoted},
+			monitored:  sentinelMonitoring(""),
+			wantMaster: lost,
+		},
+		{
+			// Sentinel may still name the lost pod; it is not probeable, so it is
+			// not a candidate and is never labelled.
+			name:       "sentinel naming the unreachable pod changes nothing",
+			notReady:   []string{"example-replication"},
+			masters:    []string{promoted},
+			monitored:  sentinelMonitoring(lost),
+			wantMaster: lost,
+		},
+		{
+			name:     "sentinel that cannot be asked changes nothing",
+			notReady: []string{"example-replication"},
+			masters:  []string{promoted},
+			monitored: func(context.Context, *rrvb2.RedisReplication, []string) (string, error) {
+				return "", errors.New("connection refused")
+			},
+			wantMaster: lost,
+		},
+		{
+			name:       "no observed master changes nothing",
+			notReady:   []string{"example-replication"},
+			monitored:  sentinelMonitoring(promoted),
+			wantMaster: lost,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, rrvb2.AddToScheme(scheme))
+			seedInstance := newSentinelReplicationInstanceForTest()
+			seedInstance.Spec.Size = ptr.To(int32(2))
+			seedInstance.Status.MasterNode = lost
+			ctrlClient := clientfake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(seedInstance).
+				WithObjects(seedInstance.DeepCopy()).
+				Build()
+			instance := &rrvb2.RedisReplication{}
+			require.NoError(t, ctrlClient.Get(context.Background(), client.ObjectKeyFromObject(seedInstance), instance))
+
+			notReady := map[string]bool{}
+			for _, name := range tt.notReady {
+				notReady[name] = true
+			}
+			var candidates []string
+			healer := &fakeHealer{}
+			replicationChanged := false
+			r := &Reconciler{
+				Client:                   ctrlClient,
+				StatefulSet:              &fakeStatefulSetService{notReady: notReady},
+				K8sClient:                fake.NewSimpleClientset(),
+				Healer:                   healer,
+				RedisReplicationTopology: topologyOf(tt.masters, nil, []string{lost}),
+				SentinelMonitoredMaster: func(ctx context.Context, inst *rrvb2.RedisReplication, masters []string) (string, error) {
+					candidates = masters
+					return tt.monitored(ctx, inst, masters)
+				},
+				CreateRedisReplicationLink: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string, string) error {
+					replicationChanged = true
+					return nil
+				},
+				ConfigureSentinel: func(context.Context, *rrvb2.RedisReplication, string) error {
+					replicationChanged = true
+					return nil
+				},
+			}
+
+			result, err := r.reconcileRedis(context.Background(), instance)
+
+			require.NoError(t, err)
+			assert.Equal(t, waitingRequeue, result)
+			assert.False(t, replicationChanged, "replication must not be reconfigured while a statefulset is not ready")
+			// Only pods that were probed and answered role:master are candidates.
+			assert.ElementsMatch(t, tt.masters, candidates)
+			assert.Equal(t, tt.wantLabel, healer.updateCalled)
+			if tt.wantLabel {
+				assert.Equal(t, tt.wantMaster, healer.master)
+			}
+			updated := &rrvb2.RedisReplication{}
+			require.NoError(t, ctrlClient.Get(context.Background(), client.ObjectKeyFromObject(instance), updated))
+			assert.Equal(t, tt.wantMaster, updated.Status.MasterNode)
+		})
+	}
+}
+
+// Without the embedded Sentinel, StatefulSet readiness gates nothing and an
+// incomplete topology keeps the regular resync: the Sentinel-only paths above
+// must not change replications that have no Sentinel to ask.
+func TestReconcileWithoutSentinelIgnoresStatefulSetReadiness(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, rrvb2.AddToScheme(scheme))
+	seedInstance := newReplicationInstanceForTest()
+	seedInstance.Status.MasterNode = "example-replication-0"
+	ctrlClient := clientfake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(seedInstance).
+		WithObjects(seedInstance.DeepCopy()).
+		Build()
+	instance := &rrvb2.RedisReplication{}
+	require.NoError(t, ctrlClient.Get(context.Background(), client.ObjectKeyFromObject(seedInstance), instance))
+
+	sentinelAsked := false
+	r := &Reconciler{
+		Client:                   ctrlClient,
+		StatefulSet:              &fakeStatefulSetService{notReady: map[string]bool{"example-replication": true}},
+		K8sClient:                fake.NewSimpleClientset(),
+		Healer:                   &fakeHealer{},
+		RedisReplicationTopology: topologyOf([]string{"example-replication-0"}, []string{"example-replication-1"}, []string{"example-replication-2"}),
+		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
+			return "example-replication-0"
+		},
+		SentinelMonitoredMaster: func(context.Context, *rrvb2.RedisReplication, []string) (string, error) {
+			sentinelAsked = true
+			return "", nil
+		},
+	}
+
+	result, err := r.reconcileRedis(context.Background(), instance)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+
+	result, err = r.reconcileStatus(context.Background(), instance)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+	assert.False(t, sentinelAsked)
+}
+
+// Once both StatefulSets are ready and every pod answered, a replication with
+// the embedded Sentinel is back on the regular resync.
+func TestReconcileStatusWithSentinelUsesRegularResyncWhenTopologyIsComplete(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, rrvb2.AddToScheme(scheme))
+	seedInstance := newSentinelReplicationInstanceForTest()
+	ctrlClient := clientfake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(seedInstance).
+		WithObjects(seedInstance.DeepCopy()).
+		Build()
+	instance := &rrvb2.RedisReplication{}
+	require.NoError(t, ctrlClient.Get(context.Background(), client.ObjectKeyFromObject(seedInstance), instance))
+
+	r := &Reconciler{
+		Client:                   ctrlClient,
+		K8sClient:                fake.NewSimpleClientset(),
+		Healer:                   &fakeHealer{},
+		RedisReplicationTopology: topologyOf([]string{"example-replication-1"}, []string{"example-replication-0", "example-replication-2"}, nil),
+	}
+
+	result, err := r.reconcileStatus(context.Background(), instance)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
 }
 
 // A two-pod replication lost its master and Sentinel promoted the survivor. It
@@ -719,7 +918,7 @@ func TestReconcileStatusRecordsPromotedMasterReportedBySentinel(t *testing.T) {
 	result, err := r.reconcileStatus(context.Background(), instance)
 
 	require.NoError(t, err)
-	assert.Equal(t, ctrl.Result{}, result)
+	assert.Equal(t, ctrl.Result{Requeue: true, RequeueAfter: sentinelIncompleteRequeue}, result)
 	// The healer is told which pod is the master, so it can drop the lost
 	// master's label even though the survivor has no replicas to show.
 	assert.Equal(t, "example-replication-1", healer.master)
@@ -1249,10 +1448,13 @@ func newSentinelReplicationInstanceForTest() *rrvb2.RedisReplication {
 	return instance
 }
 
-type fakeStatefulSetService struct{}
+// fakeStatefulSetService reports every StatefulSet ready except those in notReady.
+type fakeStatefulSetService struct {
+	notReady map[string]bool
+}
 
-func (f *fakeStatefulSetService) IsStatefulSetReady(context.Context, string, string) bool {
-	return true
+func (f *fakeStatefulSetService) IsStatefulSetReady(_ context.Context, _ string, name string) bool {
+	return !f.notReady[name]
 }
 
 func (f *fakeStatefulSetService) GetStatefulSetReplicas(context.Context, string, string) int32 {

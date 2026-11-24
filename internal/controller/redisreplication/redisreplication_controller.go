@@ -16,6 +16,7 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/monitoring"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -453,13 +454,31 @@ func (r *Reconciler) sentinelResetIfNeed(ctx context.Context, inst *rrvb2.RedisR
 	return nil
 }
 
+// sentinelIncompleteRequeue is how soon a replication with the embedded
+// Sentinel is reconciled again while a StatefulSet is not ready or the topology
+// is incomplete. That is when Sentinel may be failing over, and the master
+// Service follows the redis-role label, so the label must catch up within
+// seconds rather than at the regular 30 s resync.
+const sentinelIncompleteRequeue = 5 * time.Second
+
 func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
 	if instance.EnableSentinel() {
-		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.SentinelStatefulSet()) {
-			return intctrlutil.RequeueAfter(ctx, time.Second*30, "waiting for sentinel statefulset to be ready")
+		var waiting string
+		switch {
+		case !r.IsStatefulSetReady(ctx, instance.Namespace, instance.SentinelStatefulSet()):
+			waiting = "waiting for sentinel statefulset to be ready"
+		case !r.IsStatefulSetReady(ctx, instance.Namespace, instance.RedisStatefulSet()):
+			waiting = "waiting for redis statefulset to be ready"
 		}
-		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.RedisStatefulSet()) {
-			return intctrlutil.RequeueAfter(ctx, time.Second*30, "waiting for redis statefulset to be ready")
+		if waiting != "" {
+			// Replication is not reconfigured from a partial view, but the
+			// master Service must not keep pointing at a pod Sentinel has
+			// replaced: after a node loss the old pod stays Terminating and the
+			// StatefulSet does not become ready until the node returns.
+			if err := r.followSentinelMaster(ctx, instance); err != nil {
+				return intctrlutil.RequeueE(ctx, err, "failed to record the master elected by sentinel")
+			}
+			return intctrlutil.RequeueAfter(ctx, sentinelIncompleteRequeue, waiting)
 		}
 	}
 
@@ -581,8 +600,7 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 	if err = r.UpdateRedisReplicationMaster(ctx, instance, realMaster, masterAbsent); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
-	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
-	if err = r.Healer.UpdateRedisRoleLabel(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS, realMaster); err != nil {
+	if err = r.updateRoleLabels(ctx, instance, realMaster); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
 
@@ -592,7 +610,56 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 		monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(0))
 	}
 
+	if instance.EnableSentinel() && !topology.Complete() {
+		return intctrlutil.RequeueAfter(ctx, sentinelIncompleteRequeue, "redis replication topology is incomplete",
+			"unobservedPods", topology.Unobserved)
+	}
 	return intctrlutil.Reconciled()
+}
+
+func (r *Reconciler) updateRoleLabels(ctx context.Context, instance *rrvb2.RedisReplication, masterPod string) error {
+	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
+	return r.Healer.UpdateRedisRoleLabel(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS, masterPod)
+}
+
+// followSentinelMaster records the master a quorum of ready Sentinels names
+// and moves the redis-role labels to it, while a StatefulSet is not ready and
+// reconcileStatus does not run. The candidate must be probeable and answer
+// role:master itself, so a pod Sentinel still names after losing it is never
+// labelled. Without such a pod nothing changes: no quorum or a failed Sentinel
+// query is not evidence that the recorded master is gone.
+func (r *Reconciler) followSentinelMaster(ctx context.Context, instance *rrvb2.RedisReplication) error {
+	topology, err := r.redisReplicationTopology(ctx, instance)
+	if err != nil {
+		return fmt.Errorf("get redis replication topology: %w", err)
+	}
+	if len(topology.Masters) == 0 {
+		return nil
+	}
+	monitored, err := r.sentinelMonitoredMaster(ctx, instance, topology.Masters)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		// Not returned: it would back off the requeue, while the next
+		// attempt in a few seconds is what moves the label.
+		log.FromContext(ctx).Error(err, "Could not ask sentinel which master it monitors, leaving the master label unchanged",
+			"masters", topology.Masters)
+		return nil
+	}
+	if monitored == "" {
+		log.FromContext(ctx).V(1).Info("No quorum of ready sentinels names an observed master, leaving the master label unchanged",
+			"masters", topology.Masters,
+			"unobservedPods", topology.Unobserved)
+		return nil
+	}
+	if err := r.UpdateRedisReplicationMaster(ctx, instance, monitored, false); err != nil {
+		return fmt.Errorf("record master %s: %w", monitored, err)
+	}
+	if err := r.updateRoleLabels(ctx, instance, monitored); err != nil {
+		return fmt.Errorf("update role labels for master %s: %w", monitored, err)
+	}
+	return nil
 }
 
 func (r *Reconciler) updateStatus(ctx context.Context, rr *rrvb2.RedisReplication, status rrvb2.RedisReplicationStatus) error {
@@ -606,6 +673,11 @@ func (r *Reconciler) updateStatus(ctx context.Context, rr *rrvb2.RedisReplicatio
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rrvb2.RedisReplication{}).
+		// A pod lost or deleted changes its StatefulSet's ready count. Without
+		// the watch, the first reconcile after a failover came only with the
+		// periodic requeue, up to 30 s later, with the master label still on
+		// the old pod.
+		Owns(&appsv1.StatefulSet{}).
 		WithOptions(opts).
 		Complete(r)
 }
