@@ -1,0 +1,191 @@
+---
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: sentinel-failover-redis-replication
+spec:
+  steps:
+    - name: Deploy a RedisReplication with the embedded Sentinel
+      try:
+        - apply:
+            file: secret.yaml
+        - apply:
+            file: replication.yaml
+        - assert:
+            file: ready-sts.yaml
+
+    - name: Assert every Sentinel monitors the master
+      description: >
+        A master with two replicas and two peers on every Sentinel means the
+        operator ran SENTINEL MONITOR and Sentinel discovered the topology.
+      try:
+        - script:
+            timeout: 180s
+            content: |
+              #!/bin/bash
+              set -u
+              for i in $(seq 1 60); do
+                ALL_OK=true
+                for S in 0 1 2; do
+                  INFO=$(kubectl exec -n ${NAMESPACE} redis-replication-failover-s-${S} -c sentinel -- \
+                    redis-cli -p 26379 sentinel master mymaster 2>&1 | paste -sd' ' -)
+                  FLAGS=$(echo "${INFO}" | grep -oE 'flags [^ ]+' | cut -d' ' -f2)
+                  SLAVES=$(echo "${INFO}" | grep -oE 'num-slaves [0-9]+' | cut -d' ' -f2)
+                  PEERS=$(echo "${INFO}" | grep -oE 'num-other-sentinels [0-9]+' | cut -d' ' -f2)
+                  if [ "${FLAGS}" != "master" ] || [ "${SLAVES}" != "2" ] || [ "${PEERS}" != "2" ]; then
+                    echo "attempt ${i}: sentinel-${S} flags=${FLAGS} num-slaves=${SLAVES} num-other-sentinels=${PEERS}"
+                    ALL_OK=false
+                  fi
+                done
+                if [ "${ALL_OK}" = "true" ]; then
+                  echo "every sentinel monitors the master"
+                  exit 0
+                fi
+                sleep 3
+              done
+              exit 1
+            check:
+              (contains($stdout, 'every sentinel monitors the master')): true
+
+    - name: Fail over through the preStop hook when the master is deleted
+      description: >
+        The master's preStop hook pauses writes, waits for the replicas, runs
+        SENTINEL FAILOVER and demotes itself under the new master. Sentinel
+        logs +odown before a failover it starts on its own, so a
+        +switch-master without +odown since the deletion is the hook's
+        failover. A client writes INCR through the master Service throughout:
+        no acknowledged write may be lost, so the counter never decreases, and
+        the operator must label the new master within 15 s so writes resume.
+      try:
+        - script:
+            timeout: 240s
+            content: |
+              #!/bin/bash
+              set -u
+              sentinel_cli() {
+                kubectl exec -n ${NAMESPACE} redis-replication-failover-s-0 -c sentinel -- redis-cli -p 26379 "$@"
+              }
+              pod_by_ip() {
+                kubectl get pods -n ${NAMESPACE} -l app=redis-replication-failover \
+                  -o jsonpath="{.items[?(@.status.podIP==\"$1\")].metadata.name}"
+              }
+              OLD_IP=$(sentinel_cli sentinel get-master-addr-by-name mymaster | head -1)
+              OLD_POD=$(pod_by_ip "${OLD_IP}")
+              if [ -z "${OLD_POD}" ]; then
+                echo "no pod has the master address ${OLD_IP}"
+                exit 1
+              fi
+              # The writer runs in a pod that stays up and goes through the
+              # master Service, like an application does.
+              WRITER_POD=""
+              for P in redis-replication-failover-0 redis-replication-failover-1 redis-replication-failover-2; do
+                if [ "${P}" != "${OLD_POD}" ]; then WRITER_POD=${P}; break; fi
+              done
+              WRITER_LOG=$(mktemp)
+              kubectl exec -n ${NAMESPACE} "${WRITER_POD}" -c redis-replication-failover -- sh -c '
+                if [ -n "${REDISCLI_AUTH:-}" ]; then REDISCLI_AUTH="$(printf %s "$REDISCLI_AUTH" | tr -d "\r\n")"; export REDISCLI_AUTH; fi
+                cli() { redis-cli -h redis-replication-failover-master "$@" 2>&1; }
+                END=$(( $(date +%s) + 50 ))
+                while [ "$(date +%s)" -lt "$END" ]; do
+                  echo "incr $(date +%s) $(cli INCR failover-counter)"
+                  sleep 0.5
+                done
+                echo "final $(date +%s) $(cli GET failover-counter)"
+              ' > "${WRITER_LOG}" 2>&1 &
+              WRITER=$!
+              sleep 5
+
+              SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              DELETED_AT=$(date +%s)
+              echo "deleting master ${OLD_POD} (${OLD_IP}), writer in ${WRITER_POD}"
+              kubectl delete pod -n ${NAMESPACE} "${OLD_POD}" --wait=false
+              NEW_IP=""
+              for _ in $(seq 1 60); do
+                NEW_IP=$(sentinel_cli sentinel get-master-addr-by-name mymaster | head -1)
+                if [ -n "${NEW_IP}" ] && [ "${NEW_IP}" != "${OLD_IP}" ]; then
+                  break
+                fi
+                sleep 1
+              done
+              NEW_POD=$(pod_by_ip "${NEW_IP}")
+              echo "master moved from ${OLD_POD} (${OLD_IP}) to ${NEW_POD} (${NEW_IP})"
+              LABELLED_AFTER=""
+              while [ $(( $(date +%s) - DELETED_AT )) -le 15 ]; do
+                ROLE=$(kubectl get pod -n ${NAMESPACE} "${NEW_POD}" -o jsonpath='{.metadata.labels.redis-role}' 2>/dev/null)
+                if [ "${ROLE}" = "master" ]; then
+                  LABELLED_AFTER=$(( $(date +%s) - DELETED_AT ))
+                  break
+                fi
+                sleep 1
+              done
+              echo "new master labelled after ${LABELLED_AFTER:-more than 15}s"
+
+              wait "${WRITER}"
+              echo "writer replies other than integers:"
+              grep -vE '^incr [0-9]+ [0-9]+$' "${WRITER_LOG}" | sort -k3 | uniq -c -f2 || true
+              # Every acknowledged INCR must exceed the previous one: a lower
+              # value means writes acknowledged by the old master were lost.
+              MONOTONIC=$(awk '$1 == "incr" && $3 ~ /^[0-9]+$/ {
+                  if (seen && $3 + 0 <= last) { print "decreased from " last " to " $3; bad = 1 }
+                  last = $3 + 0; seen = 1
+                }
+                $1 == "final" { final = $3 }
+                END {
+                  if (!seen) { print "no write was acknowledged"; exit }
+                  if (final !~ /^[0-9]+$/ || final + 0 < last) { print "final value " final " is below the last acknowledged " last; bad = 1 }
+                  if (!bad) print "counter never decreased, last acknowledged " last ", final " final
+                }' "${WRITER_LOG}")
+              echo "${MONOTONIC}"
+
+              LOGS=$(kubectl logs -n ${NAMESPACE} redis-replication-failover-s-0 -c sentinel --since-time="${SINCE}")
+              echo "${LOGS}" | grep -E 'switch-master|odown|try-failover' || true
+              if [ "${NEW_IP}" != "${OLD_IP}" ] \
+                && echo "${LOGS}" | grep -q '+switch-master' \
+                && ! echo "${LOGS}" | grep -q '+odown master'; then
+                echo "preStop failover verified"
+              fi
+            check:
+              (contains($stdout, 'preStop failover verified')): true
+              (contains($stdout, 'counter never decreased')): true
+              (contains($stdout, 'new master labelled after more than 15s')): false
+              (contains($stdout, 'new master labelled after ')): true
+
+    - name: Assert the replication recovers with the new master
+      try:
+        - assert:
+            file: ready-sts.yaml
+        - script:
+            timeout: 300s
+            content: |
+              #!/bin/bash
+              set -u
+              for i in $(seq 1 90); do
+                ALL_OK=true
+                for S in 0 1 2; do
+                  INFO=$(kubectl exec -n ${NAMESPACE} redis-replication-failover-s-${S} -c sentinel -- \
+                    redis-cli -p 26379 sentinel master mymaster 2>&1 | paste -sd' ' -)
+                  FLAGS=$(echo "${INFO}" | grep -oE 'flags [^ ]+' | cut -d' ' -f2)
+                  SLAVES=$(echo "${INFO}" | grep -oE 'num-slaves [0-9]+' | cut -d' ' -f2)
+                  if [ "${FLAGS}" != "master" ] || [ "${SLAVES}" != "2" ]; then
+                    echo "attempt ${i}: sentinel-${S} flags=${FLAGS} num-slaves=${SLAVES}"
+                    ALL_OK=false
+                  fi
+                done
+                MASTER_NODE=$(kubectl get redisreplication redis-replication-failover -n ${NAMESPACE} -o jsonpath='{.status.masterNode}')
+                MASTER_IP=$(kubectl get pod -n ${NAMESPACE} "${MASTER_NODE}" -o jsonpath='{.status.podIP}' 2>/dev/null)
+                SENTINEL_IP=$(kubectl exec -n ${NAMESPACE} redis-replication-failover-s-0 -c sentinel -- \
+                  redis-cli -p 26379 sentinel get-master-addr-by-name mymaster | head -1)
+                if [ "${MASTER_IP}" != "${SENTINEL_IP}" ]; then
+                  echo "attempt ${i}: status.masterNode=${MASTER_NODE} (${MASTER_IP}), sentinel master ${SENTINEL_IP}"
+                  ALL_OK=false
+                fi
+                if [ "${ALL_OK}" = "true" ]; then
+                  echo "replication recovered under the sentinel master"
+                  exit 0
+                fi
+                sleep 3
+              done
+              exit 1
+            check:
+              (contains($stdout, 'replication recovered under the sentinel master')): true
