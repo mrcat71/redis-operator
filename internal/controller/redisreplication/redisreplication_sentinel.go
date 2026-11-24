@@ -2,6 +2,7 @@ package redisreplication
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -46,6 +47,48 @@ func newSentinelService(rr *rrvb2.RedisReplication) corev1.Service {
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
+		},
+	}
+}
+
+const (
+	// sentinelExternalConfigKey is the file the sentinel image's entrypoint
+	// includes as the last line of sentinel.conf when it exists, so its lines
+	// override everything the entrypoint rendered before it.
+	sentinelExternalConfigKey  = "redis-sentinel-additional.conf"
+	sentinelExternalConfigPath = "/etc/redis/external.conf.d"
+	sentinelTLSVolumeName      = "tls-certs"
+	sentinelTLSMountPath       = "/tls"
+	sentinelTLSConfigVolume    = "external-config"
+)
+
+// sentinelTLSConfigLines completes the TLS listener the entrypoint configures.
+// Without tls-replication Sentinel talks to Redis and to the other Sentinels in
+// plain text, so a TLS-only master shows up as disconnected; and the
+// entrypoint's "tls-auth-clients optional" would let any TLS client without a
+// certificate run SENTINEL FAILOVER, SET or REMOVE.
+const sentinelTLSConfigLines = "tls-replication yes\ntls-auth-clients yes\n"
+
+func sentinelTLSConfigMapName(rr *rrvb2.RedisReplication) string {
+	return rr.SentinelStatefulSet() + "-tls"
+}
+
+// newSentinelTLSConfigMap returns the ConfigMap the Sentinel pods include as
+// their external config when the replication runs with TLS.
+func newSentinelTLSConfigMap(rr *rrvb2.RedisReplication) corev1.ConfigMap {
+	return corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sentinelTLSConfigMapName(rr),
+			Namespace: rr.Namespace,
+			Labels: common.GetRedisLabels(
+				rr.SentinelStatefulSet(),
+				common.SetupTypeSentinel,
+				"sentinel",
+				rr.GetLabels(),
+			),
+		},
+		Data: map[string]string{
+			sentinelExternalConfigKey: sentinelTLSConfigLines,
 		},
 	}
 }
@@ -102,6 +145,24 @@ func buildSentinelPodTemplate(rr *rrvb2.RedisReplication, labels map[string]stri
 	if sentinel.ServiceAccountName != nil {
 		spec.ServiceAccountName = *sentinel.ServiceAccountName
 	}
+	if tlsConfig := rr.Spec.TLS; tlsConfig != nil {
+		spec.Volumes = append(spec.Volumes,
+			corev1.Volume{
+				Name: sentinelTLSVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					Secret: tlsConfig.Secret.DeepCopy(),
+				},
+			},
+			corev1.Volume{
+				Name: sentinelTLSConfigVolume,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: sentinelTLSConfigMapName(rr)},
+					},
+				},
+			},
+		)
+	}
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -131,6 +192,15 @@ func buildSentinelContainer(rr *rrvb2.RedisReplication) corev1.Container {
 	if rr.Spec.Sentinel.SecurityContext != nil {
 		container.SecurityContext = rr.Spec.Sentinel.SecurityContext
 	}
+	if rr.Spec.TLS != nil {
+		// Whole-directory mounts, not subPath, so the files follow a reissued
+		// certificate. The probes and the next Sentinel start pick it up; a
+		// running Sentinel keeps the certificate it loaded at startup.
+		container.VolumeMounts = []corev1.VolumeMount{
+			{Name: sentinelTLSVolumeName, MountPath: sentinelTLSMountPath, ReadOnly: true},
+			{Name: sentinelTLSConfigVolume, MountPath: sentinelExternalConfigPath, ReadOnly: true},
+		}
+	}
 	return container
 }
 
@@ -145,6 +215,9 @@ func buildSentinelEnv(rr *rrvb2.RedisReplication) []corev1.EnvVar {
 	}
 	if secret := rr.Spec.Sentinel.ExistingPasswordSecret; secret != nil {
 		envs = append(envs, secretEnvVar("REDIS_PASSWORD", secret))
+	}
+	if rr.Spec.TLS != nil {
+		envs = append(envs, k8sutils.GenerateSentinelTLSEnvironmentVariables(rr.Spec.TLS)...)
 	}
 
 	return envs
@@ -196,6 +269,10 @@ func (r *Reconciler) querySentinelMonitoredMaster(ctx context.Context, redisClie
 	if err != nil {
 		return "", fmt.Errorf("get sentinel password secret: %w", err)
 	}
+	sentinelTLS, err := r.sentinelTLSConfig(ctx, inst)
+	if err != nil {
+		return "", err
+	}
 	sentinelPods, err := r.getSentinelPods(ctx, inst)
 	if err != nil {
 		return "", fmt.Errorf("get sentinel pods: %w", err)
@@ -207,9 +284,10 @@ func (r *Reconciler) querySentinelMonitoredMaster(ctx context.Context, redisClie
 			continue
 		}
 		info, err := redisClient.Connect(&redis.ConnectionInfo{
-			Host:     sentinelPod.Status.PodIP,
-			Port:     "26379",
-			Password: sentinelPassword,
+			Host:      sentinelPod.Status.PodIP,
+			Port:      "26379",
+			Password:  sentinelPassword,
+			TLSConfig: sentinelTLS,
 		}).GetInfoSentinel(ctx)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -256,6 +334,23 @@ func sentinelAddressHost(address string) string {
 
 func (r *Reconciler) sentinelPassword(ctx context.Context, inst *rrvb2.RedisReplication) (string, error) {
 	return r.secretPassword(ctx, inst.Namespace, inst.Spec.Sentinel.ExistingPasswordSecret)
+}
+
+// sentinelTLSConfig returns the client TLS config for operator connections to
+// the embedded Sentinel, or nil when the replication does not use TLS. With
+// spec.TLS the Sentinel pods only listen on TLS and require a client
+// certificate, so a config that cannot be built is an error, not a reason to
+// fall back to plain TCP. The secret is read on every call, so a reissued
+// certificate is used from the next reconcile on.
+func (r *Reconciler) sentinelTLSConfig(ctx context.Context, inst *rrvb2.RedisReplication) (*tls.Config, error) {
+	if inst.Spec.TLS == nil {
+		return nil, nil
+	}
+	tlsConfig := k8sutils.GetRedisTLSConfig(ctx, r.K8sClient, inst.Namespace, inst.Spec.TLS)
+	if tlsConfig == nil {
+		return nil, fmt.Errorf("build sentinel TLS config from secret %q", inst.Spec.TLS.Secret.SecretName)
+	}
+	return tlsConfig, nil
 }
 
 func (r *Reconciler) masterPassword(ctx context.Context, inst *rrvb2.RedisReplication) (string, error) {

@@ -901,6 +901,23 @@ func GenerateTLSEnvironmentVariables(tlsconfig *commonapi.TLSConfig) []corev1.En
 	return envVars
 }
 
+// GenerateSentinelTLSEnvironmentVariables returns the TLS environment of a
+// Sentinel container whose config is rendered by the sentinel image's
+// entrypoint (entrypoint-sentinel.sh). That entrypoint reads the CA path from
+// REDIS_TLS_CA_KEY, not REDIS_TLS_CA_CERT, and always writes it to
+// tls-ca-cert-file, so the CA is set even without an explicit tlsConfig.CaCertFile:
+// Sentinel cannot verify Redis or its peers over TLS without one.
+func GenerateSentinelTLSEnvironmentVariables(tlsconfig *commonapi.TLSConfig) []corev1.EnvVar {
+	root := "/tls/"
+	caCert, tlsCert, tlsCertKey := getTLSSecretKeys(tlsconfig)
+	return []corev1.EnvVar{
+		{Name: "TLS_MODE", Value: "true"},
+		{Name: "REDIS_TLS_CA_KEY", Value: path.Join(root, caCert)},
+		{Name: "REDIS_TLS_CERT", Value: path.Join(root, tlsCert)},
+		{Name: "REDIS_TLS_CERT_KEY", Value: path.Join(root, tlsCertKey)},
+	}
+}
+
 // enableRedisMonitoring will add Redis Exporter as sidecar container
 func enableRedisMonitoring(params containerParameters) corev1.Container {
 	exporterDefinition := corev1.Container{

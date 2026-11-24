@@ -97,7 +97,7 @@ func Test_getRedisPassword(t *testing.T) {
 	}
 }
 
-func Test_getRedisTLSConfig(t *testing.T) {
+func Test_GetRedisTLSConfig(t *testing.T) {
 	tests := []struct {
 		name         string
 		setup        func() *k8sClientFake.Clientset
@@ -330,7 +330,7 @@ func Test_getRedisTLSConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := tt.setup()
 
-			tlsConfig := getRedisTLSConfig(context.TODO(), client, tt.redisCluster.Namespace, tt.redisCluster.Spec.TLS)
+			tlsConfig := GetRedisTLSConfig(context.TODO(), client, tt.redisCluster.Namespace, tt.redisCluster.Spec.TLS)
 
 			if tt.expectTLS {
 				require.NotNil(t, tlsConfig, "Expected TLS configuration but got nil")

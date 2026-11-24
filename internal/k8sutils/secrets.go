@@ -31,7 +31,13 @@ func getRedisPassword(ctx context.Context, client kubernetes.Interface, namespac
 	return "", nil
 }
 
-func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespace string, tlsConfig *commonapi.TLSConfig) *tls.Config {
+// GetRedisTLSConfig builds the client TLS config the operator uses towards
+// Redis and Sentinel pods from the TLS secret: the secret's certificate is
+// presented as the client certificate and the peer chain is verified against
+// its CA (or the system trust store) without checking the hostname. It
+// returns nil when TLS is not configured, and also when the secret cannot be
+// used, after logging why; callers that require TLS must treat nil as an error.
+func GetRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespace string, tlsConfig *commonapi.TLSConfig) *tls.Config {
 	if tlsConfig == nil || tlsConfig.Secret.SecretName == "" {
 		return nil
 	}

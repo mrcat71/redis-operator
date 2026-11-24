@@ -1674,6 +1674,42 @@ func TestGenerateTLSEnvironmentVariables(t *testing.T) {
 	assert.ElementsMatch(t, envVars, expectedEnvVars, "EnvVars generated for TLS config are not as expected")
 }
 
+func TestGenerateSentinelTLSEnvironmentVariables(t *testing.T) {
+	tests := []struct {
+		name      string
+		tlsConfig *common.TLSConfig
+		want      []corev1.EnvVar
+	}{
+		{
+			name:      "explicit keys",
+			tlsConfig: &common.TLSConfig{CaCertFile: "test_ca.crt", CertKeyFile: "test_tls.crt", KeyFile: "test_tls.key"},
+			want: []corev1.EnvVar{
+				{Name: "TLS_MODE", Value: "true"},
+				{Name: "REDIS_TLS_CA_KEY", Value: "/tls/test_ca.crt"},
+				{Name: "REDIS_TLS_CERT", Value: "/tls/test_tls.crt"},
+				{Name: "REDIS_TLS_CERT_KEY", Value: "/tls/test_tls.key"},
+			},
+		},
+		{
+			// Unlike the Redis pods, Sentinel always gets a CA path: the
+			// entrypoint writes it to tls-ca-cert-file unconditionally.
+			name:      "default keys still set the CA",
+			tlsConfig: &common.TLSConfig{},
+			want: []corev1.EnvVar{
+				{Name: "TLS_MODE", Value: "true"},
+				{Name: "REDIS_TLS_CA_KEY", Value: "/tls/ca.crt"},
+				{Name: "REDIS_TLS_CERT", Value: "/tls/tls.crt"},
+				{Name: "REDIS_TLS_CERT_KEY", Value: "/tls/tls.key"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, GenerateSentinelTLSEnvironmentVariables(tt.tlsConfig))
+		})
+	}
+}
+
 func TestGenerateTLSEnvironmentVariables_NoExplicitCA(t *testing.T) {
 	tlsConfig := &common.TLSConfig{
 		CertKeyFile: "test_tls.crt",
