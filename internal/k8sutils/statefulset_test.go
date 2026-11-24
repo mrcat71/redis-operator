@@ -1,12 +1,17 @@
 package k8sutils
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"path"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	common "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/consts"
@@ -184,19 +189,42 @@ func TestGenerateReplicationPreStopContent(t *testing.T) {
 	script := GeneratePreStopCommand(cfg)
 	require.NotEmpty(t, script)
 
-	// Failover targets the injected service, port and master group rather than
-	// values derived in shell, so they stay correct across names/topologies.
-	assert.Contains(t, script, `redis-cli -h "my-replication-s-hl" -p 26379 SENTINEL FAILOVER customMaster`)
-	// The demotion wait is bounded by WaitSeconds, not a hardcoded 30, and by a
-	// wall-clock deadline rather than an iteration count.
+	// Sentinel calls target the injected service, port and master group rather
+	// than values derived in shell, so they stay correct across names/topologies.
+	assert.Contains(t, script, `sentinel_cli() { redis-cli -h "my-replication-s-hl" -p 26379 "$@"; }`)
+	assert.Contains(t, script, `sentinel_cli SENTINEL FAILOVER "customMaster"`)
+	assert.Contains(t, script, `sentinel_cli SENTINEL get-master-addr-by-name "customMaster"`)
+	// The whole hook is bounded by one wall-clock deadline of WaitSeconds, and
+	// the replica catch-up by half of it.
 	assert.Contains(t, script, "DEADLINE=$(( $(date +%s) + 20 ))")
-	// Sentinel declining the failover (-NOGOODSLAVE, -INPROGRESS) must skip the
-	// wait instead of burning the whole grace budget on a demotion that is
-	// never coming.
+	assert.Contains(t, script, "CATCHUP_DEADLINE=$(( $(date +%s) + 10 ))")
+	assert.Equal(t, 1, strings.Count(script, "\nDEADLINE=$(("), "one deadline for the whole hook")
+	// The pause never outlives the hook: it is armed with the time left until
+	// DEADLINE, and an EXIT trap lifts it on every earlier exit.
+	assert.Contains(t, script, `PAUSE_MS=$(( (DEADLINE - $(date +%s)) * 1000 ))`)
+	assert.Contains(t, script, `local_cli CLIENT PAUSE "$PAUSE_MS" WRITE`)
+	assert.Contains(t, script, "trap unpause EXIT")
+	assert.Contains(t, script, "local_cli CLIENT UNPAUSE")
+
+	// The steps run in order: fence, catch up, fail over, find the new master,
+	// demote, unpause, confirm.
+	steps := []string{
+		"CLIENT PAUSE",
+		"master_repl_offset",
+		"FAILOVER_RESULT=$(sentinel_cli SENTINEL FAILOVER",
+		"NEW_MASTER=$CANDIDATE",
+		"local_cli REPLICAOF",
+		"# Paused writes are now re-run against a replica",
+		"role:slave",
+	}
+	for i := 1; i < len(steps); i++ {
+		assert.Less(t, strings.Index(script, steps[i-1]), strings.Index(script, steps[i]),
+			"%q must come before %q", steps[i-1], steps[i])
+	}
+	// Sentinel declining the failover (-NOGOODSLAVE, -INPROGRESS) must exit
+	// instead of burning the whole grace budget on a demotion that is never coming.
 	assert.Contains(t, script, "FAILOVER_RESULT=$(")
 	assert.Contains(t, script, "OK*) ;;")
-	assert.Less(t, strings.Index(script, "FAILOVER_RESULT"), strings.Index(script, "DEADLINE="),
-		"the failover result must be checked before the demotion wait is entered")
 
 	// No shell-side derivation of the service name or master group remains.
 	assert.NotContains(t, script, "CR_NAME")
@@ -264,6 +292,465 @@ func TestGenerateClusterPreStopThreadsTLSIntoEveryCall(t *testing.T) {
 		assert.Contains(t, script, want)
 	}
 	assert.Equal(t, 4, strings.Count(script, "--tls --cert"), "every redis-cli call should be TLS-enabled")
+}
+
+func TestGenerateReplicationPreStopTLS(t *testing.T) {
+	tests := []struct {
+		name         string
+		enableTLS    bool
+		wantLocal    string
+		wantSentinel string
+	}{
+		{
+			name:         "without TLS",
+			enableTLS:    false,
+			wantLocal:    `local_cli() { redis-cli -h "$(hostname)" -p "${REDIS_PORT}" "$@"; }`,
+			wantSentinel: `sentinel_cli() { redis-cli -h "my-replication-s-hl" -p 26379 "$@"; }`,
+		},
+		{
+			// Redis listens only on TLS; the embedded Sentinel stays plain text.
+			name:         "with TLS",
+			enableTLS:    true,
+			wantLocal:    `local_cli() { redis-cli -h "$(hostname)" -p "${REDIS_PORT}"` + GenerateTLSArgs(true) + ` "$@"; }`,
+			wantSentinel: `sentinel_cli() { redis-cli -h "my-replication-s-hl" -p 26379 "$@"; }`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := GeneratePreStopCommand(PreStopConfig{
+				Role:               "replication",
+				EnableTLS:          tt.enableTLS,
+				SentinelService:    "my-replication-s-hl",
+				SentinelMasterName: "mymaster",
+				SentinelPort:       26379,
+				WaitSeconds:        20,
+			})
+
+			assert.Contains(t, script, tt.wantLocal)
+			assert.Contains(t, script, tt.wantSentinel)
+			// Every call goes through one of the two wrappers, so none can miss
+			// its flags; TestReplicationPreStopScriptRuns checks the calls.
+			assert.Equal(t, 2, strings.Count(script, "redis-cli "), "only local_cli and sentinel_cli may call redis-cli")
+			if tt.enableTLS {
+				assert.Equal(t, 1, strings.Count(script, "--tls --cert"), "only the local calls use TLS")
+			} else {
+				assert.NotContains(t, script, "--tls")
+				assert.NotContains(t, script, "REDIS_TLS_")
+			}
+		})
+	}
+}
+
+// fakeRedisCLI stands in for redis-cli in TestReplicationPreStopScriptRuns. It
+// logs every call as host|tls flags|REDISCLI_AUTH|command and answers from the
+// scenario files in $FAKE_STATE. Sequences (info.master.N, the lines of
+// masters) answer successive calls, repeating the last answer when exhausted.
+// REPLICAOF with an OK reply turns the node into a replica, as the real one does.
+const fakeRedisCLI = `#!/bin/sh
+host=; tls=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h) host=$2; shift 2 ;;
+        -p) shift 2 ;;
+        --tls) tls="$tls --tls"; shift ;;
+        --cert|--key|--cacert) tls="$tls $1 $2"; shift 2 ;;
+        *) break ;;
+    esac
+done
+cmd="$*"
+printf '%s|%s|%s|%s\n' "$host" "${tls# }" "${REDISCLI_AUTH-<unset>}" "$cmd" >> "$FAKE_STATE/calls"
+# A Sentinel without a password: redis-cli warns about REDISCLI_AUTH on stderr
+# and runs the command anyway.
+if [ -f "$FAKE_STATE/sentinel-without-password" ] && [ -n "${REDISCLI_AUTH:-}" ]; then
+    case "$cmd" in SENTINEL*) echo "AUTH failed: ERR AUTH <password> called without any password configured for the default user." >&2 ;; esac
+fi
+case "$cmd" in
+    "info replication")
+        if [ "$(cat "$FAKE_STATE/role")" = slave ]; then
+            cat "$FAKE_STATE/info.slave"
+        else
+            # info.master.N, when present, answers the Nth call as a master.
+            n=$(( $(cat "$FAKE_STATE/info.n" 2>/dev/null || echo 0) + 1 ))
+            echo "$n" > "$FAKE_STATE/info.n"
+            f="$FAKE_STATE/info.master.$n"
+            [ -f "$f" ] || f="$FAKE_STATE/info.master"
+            cat "$f"
+        fi
+        ;;
+    "CLIENT PAUSE "*) cat "$FAKE_STATE/pause" ;;
+    "CLIENT UNPAUSE") echo OK ;;
+    "SENTINEL get-master-addr-by-name "*)
+        n=$(( $(cat "$FAKE_STATE/masters.n" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" > "$FAKE_STATE/masters.n"
+        line=$(sed -n "${n}p" "$FAKE_STATE/masters")
+        [ -n "$line" ] || line=$(tail -n 1 "$FAKE_STATE/masters")
+        printf '%s\n%s\n' "${line% *}" "${line#* }"
+        ;;
+    "SENTINEL FAILOVER "*) cat "$FAKE_STATE/failover" ;;
+    "REPLICAOF "*)
+        reply=$(cat "$FAKE_STATE/replicaof")
+        echo "$reply"
+        case "$reply" in OK*) echo slave > "$FAKE_STATE/role" ;; esac
+        ;;
+    *) echo "ERR unknown command '$cmd'"; exit 1 ;;
+esac
+`
+
+const fakeHostname = `#!/bin/sh
+if [ "${1:-}" = "-i" ]; then echo "10.0.0.5"; else echo "rr-0"; fi
+`
+
+type preStopCall struct {
+	host, tls, auth, cmd string
+}
+
+// TestReplicationPreStopScriptRuns executes the rendered replication preStop
+// hook under sh against a fake redis-cli and checks the calls it makes: the
+// fence, the offset wait, REPLICAOF, and that the pause is lifted on every
+// path that set it.
+func TestReplicationPreStopScriptRuns(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not available")
+	}
+
+	const (
+		self   = "10.0.0.5 6379"
+		other  = "10.0.0.6 6379"
+		caught = "role:master\r\nconnected_slaves:1\r\nslave0:ip=10.0.0.6,port=6379,state=online,offset=420,lag=0\r\nmaster_repl_offset:420\r\n"
+		behind = "role:master\r\nconnected_slaves:1\r\nslave0:ip=10.0.0.6,port=6379,state=online,offset=400,lag=1\r\nmaster_repl_offset:420\r\n"
+		alone  = "role:master\r\nconnected_slaves:0\r\nmaster_repl_offset:420\r\n"
+	)
+	happyPath := []string{
+		"info replication",
+		"SENTINEL get-master-addr-by-name mymaster",
+		"CLIENT PAUSE <ms> WRITE",
+		"info replication",
+		"SENTINEL FAILOVER mymaster",
+		"SENTINEL get-master-addr-by-name mymaster",
+		"REPLICAOF 10.0.0.6 6379",
+		"CLIENT UNPAUSE",
+		"info replication",
+	}
+
+	tests := []struct {
+		name string
+		tls  bool
+		auth string
+		wait int
+		role string
+		info string
+		// infoSeq answers the first INFO calls as a master, the role check first.
+		infoSeq   []string
+		masters   []string
+		pause     string
+		failover  string
+		replicaof string
+		// sentinelNoPassword makes the fake Sentinel warn "AUTH failed" on stderr.
+		sentinelNoPassword bool
+		// sigterm sends SIGTERM to the hook once it has run this long.
+		sigterm   time.Duration
+		wantCalls []string
+		wantLog   string
+		noLog     string
+	}{
+		{
+			name:      "lossless handoff",
+			masters:   []string{self, other},
+			wantCalls: happyPath,
+		},
+		{
+			name:      "lossless handoff with TLS and auth",
+			tls:       true,
+			auth:      "s3cret\r\n",
+			masters:   []string{self, other},
+			wantCalls: happyPath,
+		},
+		{
+			// The default embedded Sentinel has no password: the AUTH warning
+			// redis-cli prints on stderr must not be taken for the reply.
+			name:               "sentinel without a password",
+			auth:               "s3cret",
+			sentinelNoPassword: true,
+			masters:            []string{self, other},
+			wantCalls:          happyPath,
+			noLog:              "declined",
+		},
+		{
+			// The fence holds until the replica acknowledges everything; the
+			// failover is not issued while it is still behind.
+			name:      "replica catches up while paused",
+			infoSeq:   []string{caught, behind, behind},
+			masters:   []string{self, other},
+			wantCalls: happyPath,
+			noLog:     "did not catch up",
+		},
+		{
+			name:      "replica pod does nothing",
+			role:      "slave",
+			wantCalls: []string{"info replication"},
+		},
+		{
+			name:      "sentinel names another pod",
+			masters:   []string{other},
+			wantCalls: []string{"info replication", "SENTINEL get-master-addr-by-name mymaster"},
+			wantLog:   "sentinel does not report this pod as the master (10.0.0.6 6379)",
+		},
+		{
+			name:     "failover declined unpauses",
+			masters:  []string{self},
+			failover: "NOGOODSLAVE No suitable replica to promote",
+			wantCalls: []string{
+				"info replication",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT PAUSE <ms> WRITE",
+				"info replication",
+				"SENTINEL FAILOVER mymaster",
+				"CLIENT UNPAUSE",
+			},
+			wantLog: "sentinel failover declined: NOGOODSLAVE",
+		},
+		{
+			// Fail over anyway: writes stay paused, so the gap cannot grow.
+			name:    "lagging replica fails over after the catch-up window",
+			wait:    2,
+			info:    behind,
+			masters: []string{self, other},
+			wantCalls: []string{
+				"info replication",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT PAUSE <ms> WRITE",
+				"info replication",
+				"SENTINEL FAILOVER mymaster",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"REPLICAOF 10.0.0.6 6379",
+				"CLIENT UNPAUSE",
+				"info replication",
+			},
+			wantLog: "replicas did not catch up within 1s, failing over anyway (behind)",
+		},
+		{
+			name:    "no connected replica skips the offset wait",
+			info:    alone,
+			masters: []string{self, other},
+			wantCalls: []string{
+				"info replication",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT PAUSE <ms> WRITE",
+				"info replication",
+				"SENTINEL FAILOVER mymaster",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"REPLICAOF 10.0.0.6 6379",
+				"CLIENT UNPAUSE",
+				"info replication",
+			},
+			wantLog: "no replica is connected",
+		},
+		{
+			name:    "new master never reported unpauses at the deadline",
+			wait:    2,
+			masters: []string{self},
+			wantCalls: []string{
+				"info replication",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT PAUSE <ms> WRITE",
+				"info replication",
+				"SENTINEL FAILOVER mymaster",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT UNPAUSE",
+			},
+			wantLog: "sentinel did not report a new master before the deadline",
+		},
+		{
+			name:      "REPLICAOF failure still unpauses",
+			wait:      2,
+			masters:   []string{self, other},
+			replicaof: "ERR something went wrong",
+			wantCalls: []string{
+				"info replication",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT PAUSE <ms> WRITE",
+				"info replication",
+				"SENTINEL FAILOVER mymaster",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"REPLICAOF 10.0.0.6 6379",
+				"CLIENT UNPAUSE",
+				"info replication",
+			},
+			wantLog: "REPLICAOF 10.0.0.6 6379 failed, leaving the demotion to sentinel",
+		},
+		{
+			// Redis < 6.2: no fence, so no offset wait and nothing to unpause,
+			// but the prompt REPLICAOF still runs.
+			name:    "pause unsupported fails over unfenced",
+			masters: []string{self, other},
+			pause:   "ERR syntax error",
+			wantCalls: []string{
+				"info replication",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT PAUSE <ms> WRITE",
+				"SENTINEL FAILOVER mymaster",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"REPLICAOF 10.0.0.6 6379",
+				"info replication",
+			},
+			wantLog: "could not pause writes, failing over without fencing",
+		},
+		{
+			name: "announced hostnames",
+			masters: []string{
+				"rr-0.rr-headless.ns.svc.cluster.local 6379",
+				"rr-1.rr-headless.ns.svc.cluster.local 6379",
+			},
+			wantCalls: []string{
+				"info replication",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT PAUSE <ms> WRITE",
+				"info replication",
+				"SENTINEL FAILOVER mymaster",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"REPLICAOF rr-1.rr-headless.ns.svc.cluster.local 6379",
+				"CLIENT UNPAUSE",
+				"info replication",
+			},
+		},
+		{
+			name:    "SIGTERM while paused unpauses",
+			wait:    20,
+			masters: []string{self},
+			sigterm: 1500 * time.Millisecond,
+			wantCalls: []string{
+				"info replication",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT PAUSE <ms> WRITE",
+				"info replication",
+				"SENTINEL FAILOVER mymaster",
+				"SENTINEL get-master-addr-by-name mymaster",
+				"CLIENT UNPAUSE",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wait := tt.wait
+			if wait == 0 {
+				wait = 5
+			}
+			dir := t.TempDir()
+			binDir := path.Join(dir, "bin")
+			state := path.Join(dir, "state")
+			require.NoError(t, os.Mkdir(binDir, 0o755))
+			require.NoError(t, os.Mkdir(state, 0o755))
+			require.NoError(t, os.WriteFile(path.Join(binDir, "redis-cli"), []byte(fakeRedisCLI), 0o755))
+			require.NoError(t, os.WriteFile(path.Join(binDir, "hostname"), []byte(fakeHostname), 0o755))
+			files := map[string]string{
+				"role":        cmp.Or(tt.role, "master"),
+				"info.master": cmp.Or(tt.info, caught),
+				"info.slave":  "role:slave\r\nmaster_host:10.0.0.6\r\n",
+				"masters":     strings.Join(tt.masters, "\n") + "\n",
+				"pause":       cmp.Or(tt.pause, "OK"),
+				"failover":    cmp.Or(tt.failover, "OK"),
+				"replicaof":   cmp.Or(tt.replicaof, "OK"),
+			}
+			if tt.sentinelNoPassword {
+				files["sentinel-without-password"] = ""
+			}
+			for i, content := range tt.infoSeq {
+				files[fmt.Sprintf("info.master.%d", i+1)] = content
+			}
+			for name, content := range files {
+				require.NoError(t, os.WriteFile(path.Join(state, name), []byte(content+"\n"), 0o644))
+			}
+
+			script := GeneratePreStopCommand(PreStopConfig{
+				Role:               "replication",
+				EnableTLS:          tt.tls,
+				SentinelService:    "rr-s-hl",
+				SentinelMasterName: "mymaster",
+				SentinelPort:       26379,
+				WaitSeconds:        wait,
+			})
+			cmd := exec.Command(sh, "-c", script)
+			cmd.Env = []string{
+				"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+				"FAKE_STATE=" + state,
+				"REDIS_PORT=6379",
+				"REDIS_TLS_CERT=/tls/tls.crt",
+				"REDIS_TLS_CERT_KEY=/tls/tls.key",
+				"REDIS_TLS_CA_CERT=/tls/ca.crt",
+			}
+			if tt.auth != "" {
+				cmd.Env = append(cmd.Env, "REDISCLI_AUTH="+tt.auth)
+			}
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			start := time.Now()
+			require.NoError(t, cmd.Start())
+			if tt.sigterm > 0 {
+				time.AfterFunc(tt.sigterm, func() { _ = cmd.Process.Signal(syscall.SIGTERM) })
+			}
+			runErr := cmd.Wait()
+			elapsed := time.Since(start)
+			if tt.sigterm == 0 {
+				require.NoError(t, runErr, "stderr:\n%s", stderr.String())
+			}
+			assert.Less(t, elapsed, time.Duration(wait+2)*time.Second, "the hook must stay within its deadline")
+			if tt.wantLog != "" {
+				assert.Contains(t, stderr.String(), tt.wantLog)
+			}
+			if tt.noLog != "" {
+				assert.NotContains(t, stderr.String(), tt.noLog)
+			}
+
+			raw, err := os.ReadFile(path.Join(state, "calls"))
+			require.NoError(t, err)
+			var calls []preStopCall
+			for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+				fields := strings.SplitN(line, "|", 4)
+				require.Len(t, fields, 4, "malformed call log line %q", line)
+				calls = append(calls, preStopCall{host: fields[0], tls: fields[1], auth: fields[2], cmd: fields[3]})
+			}
+
+			wantTLS := ""
+			if tt.tls {
+				wantTLS = "--tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt"
+			}
+			wantAuth := "<unset>"
+			if tt.auth != "" {
+				wantAuth = strings.TrimRight(tt.auth, "\r\n")
+			}
+			var got []string
+			for _, call := range calls {
+				// Every call carries the sanitized password; the local ones also
+				// carry the TLS flags. The embedded Sentinel is plain text.
+				wantHost, wantCallTLS := "rr-0", wantTLS
+				if strings.HasPrefix(call.cmd, "SENTINEL ") {
+					wantHost, wantCallTLS = "rr-s-hl", ""
+				}
+				assert.Equal(t, wantCallTLS, call.tls, "TLS flags of %q", call.cmd)
+				assert.Equal(t, wantAuth, call.auth, "REDISCLI_AUTH of %q", call.cmd)
+				assert.Equal(t, wantHost, call.host, "host of %q", call.cmd)
+
+				normalized := call.cmd
+				if ms, ok := strings.CutPrefix(call.cmd, "CLIENT PAUSE "); ok {
+					ms = strings.TrimSuffix(ms, " WRITE")
+					pauseMS, err := strconv.Atoi(ms)
+					require.NoError(t, err)
+					// The pause must not outlive the hook.
+					assert.Positive(t, pauseMS)
+					assert.LessOrEqual(t, pauseMS, wait*1000)
+					normalized = "CLIENT PAUSE <ms> WRITE"
+				}
+				// Polling loops repeat a call; compare the sequence of distinct steps.
+				if len(got) == 0 || got[len(got)-1] != normalized {
+					got = append(got, normalized)
+				}
+			}
+			assert.Equal(t, tt.wantCalls, got, "stderr:\n%s", stderr.String())
+		})
+	}
 }
 
 func TestGenerateClusterPreStopClampsZeroWait(t *testing.T) {

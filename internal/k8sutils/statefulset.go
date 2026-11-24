@@ -656,8 +656,9 @@ func GenerateTLSArgs(enableTLS bool) string {
 
 // demotionWaitLoop renders the shell loop that blocks until the local node
 // reports role:slave, i.e. until a failover triggered above has actually
-// completed. Both the cluster and the Sentinel hook need it, so it lives in one
-// place: every hardening change here applies to both.
+// completed. The cluster hook uses it; the replication hook ends with the same
+// loop against its hook-wide deadline (replicationPreStopScript), so a
+// hardening change here belongs there too.
 //
 // The loop is bounded by a wall-clock deadline rather than an iteration count.
 // An iteration costs one redis-cli round trip plus a sleep, so counting
@@ -757,42 +758,239 @@ if [ "$ROLE" = "master" ]; then
 fi`, redisCLIAuthSanitizer, tlsArgs, tlsArgs, tlsArgs, demotionWaitLoop(tlsArgs, waitSeconds, "        "))
 }
 
-// generateReplicationPreStop generates the preStop script for Redis replication mode.
-// It checks if this pod is the master, and if so, asks Sentinel to fail over to a
-// replica before allowing the pod to terminate, preventing unnecessary downtime.
+// replicationPreStopScript is the template of the replication preStop hook; see
+// generateReplicationPreStop. The @NAME@ placeholders are substituted there.
+//
+// Shell notes:
+//   - No `redis-cli -t` per-call timeout, for the reason given on
+//     demotionWaitLoop. A hung call can overrun DEADLINE by one round trip;
+//     the write pause cannot, because it is armed to expire at DEADLINE.
+//   - INFO replies end lines with CRLF. `$0 + 0` drops the CR from offsets.
+//   - IPv6 replica addresses contain colons, so offsets are matched by name,
+//     not by splitting INFO lines on ':'.
+//   - Fractional sleep is not POSIX; images whose sleep rejects it fall back
+//     to whole seconds instead of spinning.
+const replicationPreStopScript = `#!/bin/sh
+@AUTH_SANITIZER@
+# One deadline for the whole hook, below terminationGracePeriodSeconds.
+DEADLINE=$(( $(date +%s) + @WAIT_SECONDS@ ))
+CATCHUP_DEADLINE=$(( $(date +%s) + @CATCHUP_SECONDS@ ))
+
+local_cli() { redis-cli -h "$(hostname)" -p "${REDIS_PORT}"@TLS_ARGS@ "$@"; }
+sentinel_cli() { redis-cli -h "@SENTINEL_HOST@" -p @SENTINEL_PORT@ "$@"; }
+short_sleep() { sleep 0.2 2>/dev/null || sleep 1; }
+
+ROLE=$(local_cli info replication | awk -F: '/role:master/ {print "master"}')
+if [ "$ROLE" != "master" ]; then
+    exit 0
+fi
+
+SELF_NAME=$(hostname)
+SELF_ADDRS=$(hostname -i 2>/dev/null)
+
+# is_self HOST: whether a master address reported by Sentinel is this pod.
+# Sentinel reports the pod IP, or the pod FQDN when hostnames are announced.
+is_self() {
+    case "$1" in
+        "") return 1 ;;
+        "$SELF_NAME"|"$SELF_NAME".*) return 0 ;;
+    esac
+    for addr in $SELF_ADDRS; do
+        if [ "$1" = "$addr" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# sentinel_master prints "HOST PORT" of the master Sentinel names, or nothing.
+sentinel_master() {
+    sentinel_cli SENTINEL get-master-addr-by-name "@MASTER_NAME@" 2>/dev/null | tr -d '\r' |
+        awk 'NR == 1 { host = $0 } NR == 2 { port = $0 } END { if (host != "" && port ~ /^[0-9]+$/) print host, port }'
+}
+
+# Waiting for "the master to be someone else" below only means something if
+# Sentinel names this pod now; and if it names another pod, SENTINEL FAILOVER
+# would move that pod instead of this one.
+CURRENT_MASTER=$(sentinel_master)
+if ! is_self "${CURRENT_MASTER% *}"; then
+    echo "preStop: sentinel does not report this pod as the master (${CURRENT_MASTER:-no answer}), skipping the failover" >&2
+    exit 0
+fi
+
+# Fence: from here until this node is a replica, writes wait instead of being
+# acknowledged by a master that is about to be replaced. The pause is armed to
+# expire at DEADLINE, so even a killed hook cannot leave the node paused past
+# it, and the EXIT trap lifts it on every earlier exit.
+PAUSED=0
+unpause() {
+    if [ "$PAUSED" = 1 ]; then
+        PAUSED=0
+        UNPAUSE_RESULT=$(local_cli CLIENT UNPAUSE 2>&1)
+        if [ "$UNPAUSE_RESULT" != "OK" ]; then
+            echo "preStop: CLIENT UNPAUSE failed, the pause expires at the hook deadline: $UNPAUSE_RESULT" >&2
+        fi
+    fi
+}
+trap unpause EXIT
+trap 'exit 1' HUP INT TERM
+
+PAUSE_MS=$(( (DEADLINE - $(date +%s)) * 1000 ))
+PAUSE_RESULT=$(local_cli CLIENT PAUSE "$PAUSE_MS" WRITE 2>&1)
+if [ "$PAUSE_RESULT" = "OK" ]; then
+    PAUSED=1
+else
+    # Redis older than 6.2 has no CLIENT PAUSE WRITE. Fail over unfenced, as
+    # this hook did before; the prompt REPLICAOF below still shortens the
+    # window in which the old master accepts writes.
+    echo "preStop: could not pause writes, failing over without fencing: $PAUSE_RESULT" >&2
+fi
+
+if [ "$PAUSED" = 1 ]; then
+    # With writes paused master_repl_offset stops moving, so every replica
+    # whose acknowledged offset reaches it holds every acknowledged write.
+    # Replicas acknowledge once a second, so a healthy one gets there quickly.
+    while :; do
+        CATCHUP=$(local_cli info replication | awk '
+            /^slave[0-9]+:/ {
+                n++
+                offset[n] = -1
+                if (match($0, /offset=[0-9]+/)) offset[n] = substr($0, RSTART + 7, RLENGTH - 7) + 0
+            }
+            /^master_repl_offset:/ { sub(/^master_repl_offset:/, ""); master = $0 + 0; seen = 1 }
+            END {
+                if (!seen) exit
+                if (n == 0) { print "none"; exit }
+                for (i = 1; i <= n; i++) if (offset[i] != master) { print "behind"; exit }
+                print "yes"
+            }')
+        case "$CATCHUP" in
+            yes|none) break ;;
+        esac
+        if [ "$(date +%s)" -ge "$CATCHUP_DEADLINE" ]; then
+            break
+        fi
+        short_sleep
+    done
+    case "$CATCHUP" in
+        yes) ;;
+        none)
+            echo "preStop: no replica is connected, failing over to whatever Sentinel can promote" >&2
+            ;;
+        *)
+            # Fail over anyway rather than skip. Writes stay paused, so the
+            # writes the replica lacks are only those it lacks now. Skipping
+            # unpauses: the master keeps acknowledging writes until SIGTERM
+            # stops it, and once down-after-milliseconds passes Sentinel
+            # promotes the same lagging replica, losing those writes too,
+            # after a longer outage. Redis 7's shutdown does wait for lagging
+            # replicas, but only for the grace period that is left, over the
+            # link that has just failed to catch up.
+            echo "preStop: replicas did not catch up within @CATCHUP_SECONDS@s, failing over anyway (${CATCHUP:-INFO unreadable})" >&2
+            ;;
+    esac
+fi
+
+# Only stdout holds the reply. A Sentinel without a password makes redis-cli
+# warn "AUTH failed" on stderr for REDISCLI_AUTH and run the command anyway;
+# captured with the reply, the warning hid the OK and every failover looked
+# declined.
+FAILOVER_RESULT=$(sentinel_cli SENTINEL FAILOVER "@MASTER_NAME@")
+case "$FAILOVER_RESULT" in
+    OK*) ;;
+    *)
+        # Exit 0: see generateClusterPreStop.
+        echo "preStop: sentinel failover declined: ${FAILOVER_RESULT:-no reply}" >&2
+        exit 0
+        ;;
+esac
+
+# Sentinel demotes the old master only on its next check of it, seconds after
+# promoting the replica. Demote this node as soon as Sentinel names the new
+# master instead, so it never accepts a write the new master does not have.
+NEW_MASTER=""
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    CANDIDATE=$(sentinel_master)
+    if [ -n "$CANDIDATE" ] && ! is_self "${CANDIDATE% *}"; then
+        NEW_MASTER=$CANDIDATE
+        break
+    fi
+    short_sleep
+done
+if [ -z "$NEW_MASTER" ]; then
+    echo "preStop: sentinel did not report a new master before the deadline" >&2
+    exit 0
+fi
+
+REPLICAOF_RESULT=$(local_cli REPLICAOF "${NEW_MASTER% *}" "${NEW_MASTER##* }" 2>&1)
+case "$REPLICAOF_RESULT" in
+    OK*) ;;
+    *)
+        echo "preStop: REPLICAOF $NEW_MASTER failed, leaving the demotion to sentinel: $REPLICAOF_RESULT" >&2
+        ;;
+esac
+# Paused writes are now re-run against a replica and fail with READONLY.
+unpause
+
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    NEW_ROLE=$(local_cli info replication | awk -F: '/role:slave/ {print "slave"}')
+    if [ "$NEW_ROLE" = "slave" ]; then
+        break
+    fi
+    sleep 1
+done`
+
+// generateReplicationPreStop generates the preStop script for Redis replication
+// mode. When this pod is the master Sentinel manages, it hands the master role
+// to a replica without losing acknowledged writes:
+//
+//  1. CLIENT PAUSE WRITE fences the local master.
+//  2. It waits until every connected replica's acknowledged offset equals
+//     master_repl_offset, for at most half of the budget.
+//  3. SENTINEL FAILOVER promotes a replica.
+//  4. It polls SENTINEL get-master-addr-by-name until Sentinel names another pod.
+//  5. REPLICAOF that pod, then CLIENT UNPAUSE: the paused writes fail with
+//     READONLY instead of landing on the old master.
+//  6. It waits for the local node to report role:slave.
+//
+// Without the fence the old master kept acknowledging writes until Sentinel
+// demoted it on its next check, about 10 s later, and those writes were
+// dropped when it resynced from the new master.
+//
+// Everything is bounded by one deadline, cfg.WaitSeconds from the start, which
+// is below terminationGracePeriodSeconds. The pause is armed to expire at that
+// deadline and an EXIT trap lifts it on every earlier exit, so the node is never
+// left paused.
 //
 // The Sentinel service, master group name and port are injected from the actual
 // (embedded) Sentinel configuration rather than derived in shell, so they stay
-// correct regardless of the resource name or topology. The demotion wait is
-// bounded by cfg.WaitSeconds so the hook returns before the grace period expires.
+// correct regardless of the resource name or topology. The embedded Sentinel
+// listens in plain text even when spec.TLS is set, so only the local calls carry
+// the TLS arguments. Every call authenticates with REDISCLI_AUTH, sanitized
+// first, so a Sentinel with a password needs the Redis password; a Sentinel
+// without one ignores it.
 //
-// As in the cluster hook, the wait is entered only when Sentinel accepts the
-// failover: SENTINEL FAILOVER replies -NOGOODSLAVE when no replica is eligible
-// and -INPROGRESS when one is already running, and in neither case does waiting
-// for this node's demotion achieve anything.
+// As in the cluster hook, nothing waits for a failover Sentinel declined:
+// SENTINEL FAILOVER replies -NOGOODSLAVE when no replica is eligible and
+// -INPROGRESS when one is already running.
 func generateReplicationPreStop(tlsArgs string, cfg PreStopConfig) string {
 	sentinelPort := cfg.SentinelPort
 	if sentinelPort == 0 {
 		sentinelPort = 26379
 	}
 	waitSeconds := max(cfg.WaitSeconds, 1)
-	return fmt.Sprintf(`#!/bin/sh
-%s
-ROLE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s info replication | awk -F: '/role:master/ {print "master"}')
-
-if [ "$ROLE" = "master" ]; then
-    FAILOVER_RESULT=$(redis-cli -h "%s" -p %d SENTINEL FAILOVER %s 2>&1)
-    case "$FAILOVER_RESULT" in
-        OK*) ;;
-        *)
-            # Exit 0: see generateClusterPreStop.
-            echo "preStop: sentinel failover declined: $FAILOVER_RESULT" >&2
-            exit 0
-            ;;
-    esac
-
-    %s
-fi`, redisCLIAuthSanitizer, tlsArgs, cfg.SentinelService, sentinelPort, cfg.SentinelMasterName, demotionWaitLoop(tlsArgs, waitSeconds, "    "))
+	// The rest of the budget is left for Sentinel to promote a replica and for
+	// the local demotion; both take about a second when nothing is wrong.
+	catchupSeconds := max(waitSeconds/2, 1)
+	return strings.NewReplacer(
+		"@AUTH_SANITIZER@", redisCLIAuthSanitizer,
+		"@WAIT_SECONDS@", strconv.Itoa(waitSeconds),
+		"@CATCHUP_SECONDS@", strconv.Itoa(catchupSeconds),
+		"@TLS_ARGS@", tlsArgs,
+		"@SENTINEL_HOST@", cfg.SentinelService,
+		"@SENTINEL_PORT@", strconv.Itoa(sentinelPort),
+		"@MASTER_NAME@", cfg.SentinelMasterName,
+	).Replace(replicationPreStopScript)
 }
 
 func generateInitContainerDef(role, name string, initcontainerParams initContainerParameters, externalConfig *string, mountpath []corev1.VolumeMount, containerParams containerParameters, clusterVersion *string) []corev1.Container {
