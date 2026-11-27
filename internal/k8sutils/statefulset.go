@@ -878,9 +878,9 @@ PAUSE_RESULT=$(local_cli CLIENT PAUSE "$PAUSE_MS" WRITE 2>&1)
 if [ "$PAUSE_RESULT" = "OK" ]; then
     PAUSED=1
 else
-    # Redis older than 6.2 has no CLIENT PAUSE WRITE. Fail over unfenced, as
-    # this hook did before; the prompt REPLICAOF below still shortens the
-    # window in which the old master accepts writes.
+    # Redis older than 6.2 has no CLIENT PAUSE WRITE. Fail over without the
+    # fence; the prompt REPLICAOF below still shortens the window in which the
+    # old master accepts writes.
     echo "preStop: could not pause writes, failing over without fencing: $PAUSE_RESULT" >&2
 fi
 
@@ -990,9 +990,9 @@ done`
 //     READONLY instead of landing on the old master.
 //  6. It waits for the local node to report role:slave.
 //
-// Without the fence the old master kept acknowledging writes until Sentinel
-// demoted it on its next check, about 10 s later, and those writes were
-// dropped when it resynced from the new master.
+// Without the fence the old master keeps acknowledging writes until Sentinel
+// demotes it on its next check, about 10 s later, and those writes are dropped
+// when it resyncs from the new master.
 //
 // Everything is bounded by one deadline, cfg.WaitSeconds from the start, which
 // is below terminationGracePeriodSeconds. The pause is armed to expire at that

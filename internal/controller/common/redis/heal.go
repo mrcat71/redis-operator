@@ -112,9 +112,6 @@ func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map
 		isMaster bool
 	}
 	var probed []probedPod
-	// The pod the caller identified as the master needs no further proof: a
-	// survivor promoted by Sentinel after its only peer was lost has no replica
-	// left to attach, yet it is the master and the lost peer's label is stale.
 	var identifiedMasterAnswered bool
 	var unreachableMasterPods []string
 	for i := range pods.Items {
@@ -153,6 +150,9 @@ func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map
 		}
 	}
 
+	// The pod the caller identified as the master needs no further proof: a
+	// survivor promoted by Sentinel after its only peer was lost has no replica
+	// left to attach, yet it is the master and the lost peer's label is stale.
 	masterConfirmed := identifiedMasterAnswered
 	for _, p := range probed {
 		pod := p.pod

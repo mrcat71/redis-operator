@@ -690,9 +690,9 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rrvb2.RedisReplication{}).
 		// A pod lost or deleted changes its StatefulSet's ready count. Without
-		// the watch, the first reconcile after a failover came only with the
-		// periodic requeue, up to 30 s later, with the master label still on
-		// the old pod.
+		// the watch, the first reconcile after a failover would come only with
+		// the periodic requeue, up to 30 s later, with the master label still
+		// on the old pod.
 		Owns(&appsv1.StatefulSet{}).
 		WithOptions(opts).
 		Complete(r)
