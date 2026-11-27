@@ -94,6 +94,18 @@ spec:
                 echo "final $(date +%s) $(cli GET failover-counter)"
               ' > "${WRITER_LOG}" 2>&1 &
               WRITER=$!
+              # The old master returns as a standalone master with its
+              # pre-failover data; the master Service must never select it
+              # next to the new master.
+              LABEL_LOG=$(mktemp)
+              (
+                END=$(( $(date +%s) + 50 ))
+                while [ "$(date +%s)" -lt "$END" ]; do
+                  kubectl get pods -n ${NAMESPACE} -l app=redis-replication-failover,redis-role=master -o name | wc -l
+                  sleep 0.5
+                done
+              ) > "${LABEL_LOG}" 2>/dev/null &
+              LABELS=$!
               sleep 5
 
               SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -122,6 +134,8 @@ spec:
               echo "new master labelled after ${LABELLED_AFTER:-more than 15}s"
 
               wait "${WRITER}"
+              wait "${LABELS}"
+              echo "at most $(sort -n "${LABEL_LOG}" | tail -1) pods labelled master at once"
               echo "writer replies other than integers:"
               grep -vE '^incr [0-9]+ [0-9]+$' "${WRITER_LOG}" | sort -k3 | uniq -c -f2 || true
               # Every acknowledged INCR must exceed the previous one: a lower
@@ -148,6 +162,7 @@ spec:
             check:
               (contains($stdout, 'preStop failover verified')): true
               (contains($stdout, 'counter never decreased')): true
+              (contains($stdout, 'at most 1 pods labelled master at once')): true
               (contains($stdout, 'new master labelled after more than 15s')): false
               (contains($stdout, 'new master labelled after ')): true
 

@@ -177,6 +177,8 @@ The hook runs for at most `terminationGracePeriodSeconds` minus 10 seconds (20 s
 
 The `<name>-master` Service selects the pod labelled `redis-role=master`. The operator moves that label to the pod a quorum of ready Sentinels names as master as soon as that pod answers as a master, even while a StatefulSet is not ready, for example while a pod on a lost node is stuck `Terminating`. It rechecks every 5 seconds until both StatefulSets are ready and every Redis pod answers. Replication itself is reconfigured only once both StatefulSets are ready again.
 
+A Redis pod that restarts comes up as a standalone master until it is attached as a replica, and the old master returns after the failover in that state, with the data it held before. While another pod is the master, the operator gives such a pod no `redis-role` label, so neither the `<name>-master` nor the `<name>-replica` Service routes to it and it takes no writes that its resync would drop. It gets the `slave` label once it answers as a replica.
+
 ## Embedded Sentinel Probes
 
 The Sentinel container has readiness and liveness probes that run `redis-cli PING` against port 26379 and expect `PONG`, authenticating with `spec.sentinel.redisSecret` when it is set and using TLS when `spec.TLS` is set. A Sentinel pod is ready only once it answers. The operator waits for all Sentinel pods to be ready before configuring replication and asks only ready Sentinels which master they monitor.

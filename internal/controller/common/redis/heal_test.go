@@ -524,6 +524,132 @@ func TestUpdateRedisRoleLabelKeepsMasterLabelWhenReplicaCountCannotBeRead(t *tes
 	assert.Equal(t, common.RedisRoleLabelMaster, unreachablePod.Labels[common.RedisRoleLabelKey])
 }
 
+// A pod that restarts boots as a standalone master, and the old master returns
+// after a failover with its pre-failover data. While another pod is the
+// identified master, such a pod must be in neither the master nor the replica
+// Service: writes it takes are dropped when it resyncs.
+func TestUpdateRedisRoleLabelWithholdsRoleFromStandaloneMasterWhileAnotherIsIdentified(t *testing.T) {
+	const (
+		pod0, pod1 = "redis-0", "redis-1"
+		ip0, ip1   = "10.0.0.10", "10.0.0.11"
+		noLabel    = ""
+	)
+	tests := []struct {
+		name       string
+		masterPod  string
+		oldLabels  map[string]string
+		isMaster   map[string]bool
+		replicas   map[string]int
+		replicaErr map[string]error
+		probeErr   map[string]error
+		wantLabels map[string]string
+	}{
+		{
+			name:       "old master returns after a failover",
+			masterPod:  pod1,
+			oldLabels:  map[string]string{pod1: common.RedisRoleLabelMaster},
+			isMaster:   map[string]bool{ip0: true, ip1: true},
+			wantLabels: map[string]string{pod0: noLabel, pod1: common.RedisRoleLabelMaster},
+		},
+		{
+			name:       "identified master is first in the list",
+			masterPod:  pod0,
+			oldLabels:  map[string]string{pod0: common.RedisRoleLabelMaster},
+			isMaster:   map[string]bool{ip0: true, ip1: true},
+			wantLabels: map[string]string{pod0: common.RedisRoleLabelMaster, pod1: noLabel},
+		},
+		{
+			name:       "a stale master label is removed",
+			masterPod:  pod1,
+			oldLabels:  map[string]string{pod0: common.RedisRoleLabelMaster, pod1: common.RedisRoleLabelMaster},
+			isMaster:   map[string]bool{ip0: true, ip1: true},
+			wantLabels: map[string]string{pod0: noLabel, pod1: common.RedisRoleLabelMaster},
+		},
+		{
+			// Labelled slave, it would be in the replica Service while accepting writes.
+			name:       "a stale slave label is removed",
+			masterPod:  pod1,
+			oldLabels:  map[string]string{pod0: common.RedisRoleLabelSlave, pod1: common.RedisRoleLabelMaster},
+			isMaster:   map[string]bool{ip0: true, ip1: true},
+			wantLabels: map[string]string{pod0: noLabel, pod1: common.RedisRoleLabelMaster},
+		},
+		{
+			// Two masters with replicas is not a restarted pod; that is for the
+			// controller to resolve, and both keep answering as masters.
+			name:       "another master with replicas keeps the master label",
+			masterPod:  pod1,
+			isMaster:   map[string]bool{ip0: true, ip1: true},
+			replicas:   map[string]int{ip0: 1},
+			wantLabels: map[string]string{pod0: common.RedisRoleLabelMaster, pod1: common.RedisRoleLabelMaster},
+		},
+		{
+			name:       "an unreadable replica count is not evidence",
+			masterPod:  pod1,
+			isMaster:   map[string]bool{ip0: true, ip1: true},
+			replicaErr: map[string]error{ip0: errors.New("read tcp: i/o timeout")},
+			wantLabels: map[string]string{pod0: common.RedisRoleLabelMaster, pod1: common.RedisRoleLabelMaster},
+		},
+		{
+			// The identified master only counts once it answers as master here.
+			name:       "identified master answers as a replica",
+			masterPod:  pod1,
+			isMaster:   map[string]bool{ip0: true},
+			wantLabels: map[string]string{pod0: common.RedisRoleLabelMaster, pod1: common.RedisRoleLabelSlave},
+		},
+		{
+			name:       "identified master does not answer",
+			masterPod:  pod1,
+			oldLabels:  map[string]string{pod1: common.RedisRoleLabelSlave},
+			isMaster:   map[string]bool{ip0: true},
+			probeErr:   map[string]error{ip1: dialError()},
+			wantLabels: map[string]string{pod0: common.RedisRoleLabelMaster, pod1: common.RedisRoleLabelSlave},
+		},
+		{
+			// RedisCluster passes no master, and every master is labelled.
+			name:       "no identified master",
+			isMaster:   map[string]bool{ip0: true, ip1: true},
+			wantLabels: map[string]string{pod0: common.RedisRoleLabelMaster, pod1: common.RedisRoleLabelMaster},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			labels := map[string]string{"app": "redis"}
+			p0 := newLabeledRedisPod(pod0, labels, ip0, corev1.PodRunning, true)
+			p1 := newLabeledRedisPod(pod1, labels, ip1, corev1.PodRunning, true)
+			for _, pod := range []*corev1.Pod{p0, p1} {
+				if role, ok := tt.oldLabels[pod.Name]; ok {
+					pod.Labels[common.RedisRoleLabelKey] = role
+				}
+			}
+			clientset := k8sfake.NewSimpleClientset(p0, p1)
+			redisClient := &fakeRedisClient{
+				isMasterByHost:   tt.isMaster,
+				replicasByHost:   tt.replicas,
+				replicaErrByHost: tt.replicaErr,
+				errByHost:        tt.probeErr,
+			}
+			h := &healer{k8s: clientset, redis: redisClient}
+
+			err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, tt.masterPod)
+
+			require.NoError(t, err)
+			// One connection per pod: the replica count is read on the handle that
+			// answered the role probe.
+			assert.Equal(t, []string{ip0, ip1}, redisClient.connectHosts)
+			for name, want := range tt.wantLabels {
+				pod, err := clientset.CoreV1().Pods("default").Get(context.Background(), name, metav1.GetOptions{})
+				require.NoError(t, err)
+				got, ok := pod.Labels[common.RedisRoleLabelKey]
+				if want == noLabel {
+					assert.False(t, ok, "%s must have no role label, has %q", name, got)
+					continue
+				}
+				assert.Equal(t, want, got, "role label of %s", name)
+			}
+		})
+	}
+}
+
 // A cancelled reconcile - a manager shutdown, say - fails every probe. That is
 // not evidence about any pod, so the sweep must abort and report it rather than
 // deciding labels from a view it could not build.

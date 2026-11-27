@@ -45,7 +45,14 @@ type Healer interface {
 	// as the master (through Sentinel, say, after a failover that left it no replica to attach).
 	// In that case the old master label is removed, because keeping it could point the master
 	// service at a dead pod. If that removal fails, an error is returned so the caller retries.
-	// Pass an empty masterPod when no master has been identified.
+	//
+	// When masterPod answers as master, any other pod that answers as master without
+	// attached replicas gets no role label, and loses the one it has: it is a pod that
+	// restarted and has not been attached as a replica yet, such as the old master
+	// returning after a failover, and the master Service must not route to it.
+	//
+	// Pass an empty masterPod when no master has been identified; every pod that answers
+	// as master is then labelled master, as RedisCluster needs.
 	UpdateRedisRoleLabel(ctx context.Context, ns string, labels map[string]string, secret *commonapi.ExistingPasswordSecret, tlsConfig *commonapi.TLSConfig, masterPod string) error
 }
 
@@ -96,14 +103,27 @@ func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map
 		}
 	}
 
-	var masterConfirmed bool
+	// Every pod is probed before any label changes: whether a master without
+	// replicas gets the master label depends on whether masterPod answered as
+	// master, and masterPod can be anywhere in the list.
+	type probedPod struct {
+		pod      *v1.Pod
+		service  redis.Service
+		isMaster bool
+	}
+	var probed []probedPod
+	// The pod the caller identified as the master needs no further proof: a
+	// survivor promoted by Sentinel after its only peer was lost has no replica
+	// left to attach, yet it is the master and the lost peer's label is stale.
+	var identifiedMasterAnswered bool
 	var unreachableMasterPods []string
-	for _, pod := range pods.Items {
-		if !k8sutils.IsRedisPodProbeable(&pod) {
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !k8sutils.IsRedisPodProbeable(pod) {
 			continue
 		}
 
-		connInfo := createConnectionInfo(ctx, pod, password, tlsConfig, h.k8s, ns, "6379")
+		connInfo := createConnectionInfo(ctx, *pod, password, tlsConfig, h.k8s, ns, "6379")
 		redisService := h.redis.Connect(connInfo)
 		isMaster, err := redisService.IsMaster(ctx)
 		if err != nil {
@@ -127,17 +147,20 @@ func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map
 			}
 			continue
 		}
+		probed = append(probed, probedPod{pod: pod, service: redisService, isMaster: isMaster})
+		if isMaster && masterPod != "" && pod.Name == masterPod {
+			identifiedMasterAnswered = true
+		}
+	}
+
+	masterConfirmed := identifiedMasterAnswered
+	for _, p := range probed {
+		pod := p.pod
 		role := common.RedisRoleLabelSlave
-		if isMaster {
+		if p.isMaster {
 			role = common.RedisRoleLabelMaster
-			// The pod the caller identified as the master needs no further proof: a
-			// survivor promoted by Sentinel after its only peer was lost has no replica
-			// left to attach, yet it is the master and the lost peer's label is stale.
-			if !masterConfirmed && pod.Name == masterPod {
-				masterConfirmed = true
-			}
-			if !masterConfirmed {
-				replicas, rErr := redisService.GetAttachedReplicaCount(ctx)
+			if pod.Name != masterPod && (identifiedMasterAnswered || !masterConfirmed) {
+				replicas, rErr := p.service.GetAttachedReplicaCount(ctx)
 				switch {
 				case rErr != nil:
 					if ctxErr := ctx.Err(); ctxErr != nil {
@@ -149,8 +172,42 @@ func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map
 					)
 				case replicas > 0:
 					masterConfirmed = true
+				case identifiedMasterAnswered:
+					// A pod that restarts boots as a standalone master until it is
+					// attached as a replica, and the old master returning after a
+					// failover does so with its pre-failover data. Labelled master,
+					// it would put the master Service on two pods; labelled slave,
+					// the replica Service on a pod that accepts writes. Either way
+					// the writes it takes are dropped when it resyncs, so it gets
+					// no role label until it answers as a replica.
+					role = ""
+					log.FromContext(ctx).Info("withholding the role label of a master without replicas, another pod is the identified master",
+						"pod", pod.Name,
+						"identifiedMaster", masterPod,
+					)
 				}
 			}
+		}
+		if role == "" {
+			oldRole, labelled := pod.Labels[common.RedisRoleLabelKey]
+			if !labelled {
+				continue
+			}
+			rErr := retry.RetryOnConflict(retry.DefaultRetry, removeRoleLabelFunc(pod.Name))
+			switch {
+			case rErr == nil:
+				log.FromContext(ctx).Info("removed pod role label",
+					"pod", pod.Name,
+					"oldRole", oldRole,
+				)
+			case apierrors.IsNotFound(rErr):
+				log.FromContext(ctx).V(1).Info("pod was deleted before its role label could be removed",
+					"pod", pod.Name,
+				)
+			default:
+				return fmt.Errorf("failed to remove role label from pod %s: %w", pod.Name, rErr)
+			}
+			continue
 		}
 		if oldRole := pod.Labels[common.RedisRoleLabelKey]; oldRole != role {
 			patch := []byte(fmt.Sprintf(`[{"op": "add", "path": "/metadata/labels/%s", "value": "%s"}]`, common.RedisRoleLabelKey, role))
