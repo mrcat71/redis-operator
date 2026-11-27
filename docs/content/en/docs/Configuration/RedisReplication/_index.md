@@ -164,7 +164,7 @@ spec:
 
 ## Planned Failover with the Embedded Sentinel
 
-When the master pod is deleted, drained or rolled, its preStop hook hands the master role to a replica without losing acknowledged writes:
+When the master pod is deleted, drained or evicted, its preStop hook hands the master role to a replica without losing acknowledged writes (see below for rolling restarts):
 
 1. `CLIENT PAUSE WRITE` stops the master from accepting writes. Clients wait instead of receiving errors.
 2. The hook waits until every connected replica has acknowledged the master's replication offset, for at most half of the hook's time budget.
@@ -178,6 +178,15 @@ The hook runs for at most `terminationGracePeriodSeconds` minus 10 seconds (20 s
 The `<name>-master` Service selects the pod labelled `redis-role=master`. The operator moves that label to the pod a quorum of ready Sentinels names as master as soon as that pod answers as a master, even while a StatefulSet is not ready, for example while a pod on a lost node is stuck `Terminating`. It rechecks every 5 seconds until both StatefulSets are ready and every Redis pod answers. Replication itself is reconfigured only once both StatefulSets are ready again.
 
 A Redis pod that restarts comes up as a standalone master until it is attached as a replica, and the old master returns after the failover in that state, with the data it held before. While another pod is the master, the operator gives such a pod no `redis-role` label, so neither the `<name>-master` nor the `<name>-replica` Service routes to it and it takes no writes that its resync would drop. It gets the `slave` label once it answers as a replica.
+
+### Rolling restarts
+
+A rolling restart of the Redis StatefulSet, which a change to the pod template triggers (an operator or Redis upgrade, new resources or configuration), does not yet keep this guarantee. A restarted pod comes up as a standalone master: Sentinel does not know its new IP, and the operator does not attach it as a replica while the StatefulSet is not ready. The StatefulSet considers it ready as soon as it answers `PING` and restarts the next pod. By the time the master restarts, its replicas may all be standalone, so:
+
+- The hook finds no replica to promote (Sentinel logs `-failover-abort-no-good-slave`) and the master stops without a handoff. Until it is back, there is no master: writes fail rather than being lost.
+- Once every pod has restarted, they are all standalone masters while Sentinel still names the old master's IP, so the operator cannot identify the master. For a few seconds the `<name>-master` Service can select more than one pod, and writes that reach the wrong one are dropped when it resyncs. The operator then reattaches the pods to the last master it recorded.
+
+To restart the pods without losing the handoff, delete them one at a time instead: wait until each restarted pod has the `redis-role=slave` label before deleting the next one, and delete the master last.
 
 ## Embedded Sentinel Probes
 
