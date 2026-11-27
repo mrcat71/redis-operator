@@ -96,12 +96,15 @@ spec:
               WRITER=$!
               # The old master returns as a standalone master with its
               # pre-failover data; the master Service must never select it
-              # next to the new master.
+              # next to the new master. Only ready pods that are not
+              # terminating are in the Service, so only those count.
               LABEL_LOG=$(mktemp)
               (
                 END=$(( $(date +%s) + 50 ))
                 while [ "$(date +%s)" -lt "$END" ]; do
-                  kubectl get pods -n ${NAMESPACE} -l app=redis-replication-failover,redis-role=master -o name | wc -l
+                  kubectl get pods -n ${NAMESPACE} -l app=redis-replication-failover,redis-role=master \
+                    -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status},{.metadata.deletionTimestamp}{"\n"}{end}' |
+                    awk -F, '$1 == "True" && $2 == "" { n++ } END { print n + 0 }'
                   sleep 0.5
                 done
               ) > "${LABEL_LOG}" 2>/dev/null &
