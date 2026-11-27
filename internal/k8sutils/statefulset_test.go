@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -191,9 +192,11 @@ func TestGenerateReplicationPreStopContent(t *testing.T) {
 
 	// Sentinel calls target the injected service, port and master group rather
 	// than values derived in shell, so they stay correct across names/topologies.
-	assert.Contains(t, script, `sentinel_cli() { redis-cli -h "my-replication-s-hl" -p 26379 "$@"; }`)
-	assert.Contains(t, script, `sentinel_cli SENTINEL FAILOVER "customMaster"`)
-	assert.Contains(t, script, `sentinel_cli SENTINEL get-master-addr-by-name "customMaster"`)
+	// They authenticate with the Sentinel's own password through sentinel_cli.
+	assert.Contains(t, script, sentinelCLIFunc)
+	assert.Contains(t, script, `sentinel_call() { sentinel_cli -h "my-replication-s-hl" -p 26379 "$@"; }`)
+	assert.Contains(t, script, `sentinel_call SENTINEL FAILOVER "customMaster"`)
+	assert.Contains(t, script, `sentinel_call SENTINEL get-master-addr-by-name "customMaster"`)
 	// The whole hook is bounded by one wall-clock deadline of WaitSeconds, and
 	// the replica catch-up by half of it.
 	assert.Contains(t, script, "DEADLINE=$(( $(date +%s) + 20 ))")
@@ -211,7 +214,7 @@ func TestGenerateReplicationPreStopContent(t *testing.T) {
 	steps := []string{
 		"CLIENT PAUSE",
 		"master_repl_offset",
-		"FAILOVER_RESULT=$(sentinel_cli SENTINEL FAILOVER",
+		"FAILOVER_RESULT=$(sentinel_call SENTINEL FAILOVER",
 		"NEW_MASTER=$CANDIDATE",
 		"local_cli REPLICAOF",
 		"# Paused writes are now re-run against a replica",
@@ -305,14 +308,16 @@ func TestGenerateReplicationPreStopTLS(t *testing.T) {
 			name:         "without TLS",
 			enableTLS:    false,
 			wantLocal:    `local_cli() { redis-cli -h "$(hostname)" -p "${REDIS_PORT}" "$@"; }`,
-			wantSentinel: `sentinel_cli() { redis-cli -h "my-replication-s-hl" -p 26379 "$@"; }`,
+			wantSentinel: `sentinel_call() { sentinel_cli -h "my-replication-s-hl" -p 26379 "$@"; }`,
 		},
 		{
-			// Redis listens only on TLS; the embedded Sentinel stays plain text.
+			// The embedded Sentinel only listens on TLS and requires a client
+			// certificate, so its calls need the same flags as the local calls
+			// or the hook never fails over.
 			name:         "with TLS",
 			enableTLS:    true,
 			wantLocal:    `local_cli() { redis-cli -h "$(hostname)" -p "${REDIS_PORT}"` + GenerateTLSArgs(true) + ` "$@"; }`,
-			wantSentinel: `sentinel_cli() { redis-cli -h "my-replication-s-hl" -p 26379 "$@"; }`,
+			wantSentinel: `sentinel_call() { sentinel_cli -h "my-replication-s-hl" -p 26379` + GenerateTLSArgs(true) + ` "$@"; }`,
 		},
 	}
 	for _, tt := range tests {
@@ -328,11 +333,13 @@ func TestGenerateReplicationPreStopTLS(t *testing.T) {
 
 			assert.Contains(t, script, tt.wantLocal)
 			assert.Contains(t, script, tt.wantSentinel)
-			// Every call goes through one of the two wrappers, so none can miss
-			// its flags; TestReplicationPreStopScriptRuns checks the calls.
-			assert.Equal(t, 2, strings.Count(script, "redis-cli "), "only local_cli and sentinel_cli may call redis-cli")
+			// Every call goes through local_cli or sentinel_call, so none can
+			// miss its flags; TestReplicationPreStopScriptRuns checks the calls.
+			assert.Equal(t, 1, strings.Count(script, "redis-cli -h"), "only local_cli may call redis-cli directly")
+			assert.Equal(t, 1, strings.Count(script, `exec redis-cli "$@"`), "sentinel_cli is the only other redis-cli call")
+			assert.Equal(t, 1, strings.Count(script, "sentinel_cli -h"), "only sentinel_call may call sentinel_cli")
 			if tt.enableTLS {
-				assert.Equal(t, 1, strings.Count(script, "--tls --cert"), "only the local calls use TLS")
+				assert.Equal(t, 2, strings.Count(script, "--tls --cert"), "only the two wrappers carry TLS flags")
 			} else {
 				assert.NotContains(t, script, "--tls")
 				assert.NotContains(t, script, "REDIS_TLS_")
@@ -437,9 +444,11 @@ func TestReplicationPreStopScriptRuns(t *testing.T) {
 		name string
 		tls  bool
 		auth string
-		wait int
-		role string
-		info string
+		// sentinelAuth is the Sentinel's own password (SENTINEL_REDISCLI_AUTH).
+		sentinelAuth string
+		wait         int
+		role         string
+		info         string
 		// infoSeq answers the first INFO calls as a master, the role check first.
 		infoSeq   []string
 		masters   []string
@@ -467,8 +476,18 @@ func TestReplicationPreStopScriptRuns(t *testing.T) {
 			wantCalls: happyPath,
 		},
 		{
-			// The default embedded Sentinel has no password: the AUTH warning
-			// redis-cli prints on stderr must not be taken for the reply.
+			// Distinct passwords: Sentinel calls must send the Sentinel's own,
+			// local calls the Redis one.
+			name:         "distinct sentinel password with TLS",
+			tls:          true,
+			auth:         "s3cret",
+			sentinelAuth: "sentinel-pass\n",
+			masters:      []string{self, other},
+			wantCalls:    happyPath,
+		},
+		{
+			// The default embedded Sentinel has no password: the Redis password
+			// must not reach it, or redis-cli warns "AUTH failed" on stderr.
 			name:               "sentinel without a password",
 			auth:               "s3cret",
 			sentinelNoPassword: true,
@@ -684,6 +703,9 @@ func TestReplicationPreStopScriptRuns(t *testing.T) {
 			if tt.auth != "" {
 				cmd.Env = append(cmd.Env, "REDISCLI_AUTH="+tt.auth)
 			}
+			if tt.sentinelAuth != "" {
+				cmd.Env = append(cmd.Env, sentinelCLIAuthEnv+"="+tt.sentinelAuth)
+			}
 			var stderr strings.Builder
 			cmd.Stderr = &stderr
 			start := time.Now()
@@ -717,19 +739,21 @@ func TestReplicationPreStopScriptRuns(t *testing.T) {
 			if tt.tls {
 				wantTLS = "--tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt"
 			}
-			wantAuth := "<unset>"
-			if tt.auth != "" {
-				wantAuth = strings.TrimRight(tt.auth, "\r\n")
+			sanitized := func(password string) string {
+				if password == "" {
+					return "<unset>"
+				}
+				return strings.TrimRight(password, "\r\n")
 			}
 			var got []string
 			for _, call := range calls {
-				// Every call carries the sanitized password; the local ones also
-				// carry the TLS flags. The embedded Sentinel is plain text.
-				wantHost, wantCallTLS := "rr-0", wantTLS
+				// Every call carries the TLS flags. Local calls send the sanitized
+				// Redis password, Sentinel calls the sanitized Sentinel password.
+				wantHost, wantAuth := "rr-0", sanitized(tt.auth)
 				if strings.HasPrefix(call.cmd, "SENTINEL ") {
-					wantHost, wantCallTLS = "rr-s-hl", ""
+					wantHost, wantAuth = "rr-s-hl", sanitized(tt.sentinelAuth)
 				}
-				assert.Equal(t, wantCallTLS, call.tls, "TLS flags of %q", call.cmd)
+				assert.Equal(t, wantTLS, call.tls, "TLS flags of %q", call.cmd)
 				assert.Equal(t, wantAuth, call.auth, "REDISCLI_AUTH of %q", call.cmd)
 				assert.Equal(t, wantHost, call.host, "host of %q", call.cmd)
 
@@ -749,6 +773,125 @@ func TestReplicationPreStopScriptRuns(t *testing.T) {
 				}
 			}
 			assert.Equal(t, tt.wantCalls, got, "stderr:\n%s", stderr.String())
+		})
+	}
+}
+
+func TestGenerateContainerDefSentinelAuthEnv(t *testing.T) {
+	sentinelSecret := &common.ExistingPasswordSecret{Name: ptr.To("sentinel-secret"), Key: ptr.To("password")}
+	wantEnv := corev1.EnvVar{
+		Name: sentinelCLIAuthEnv,
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "sentinel-secret"},
+				Key:                  "password",
+			},
+		},
+	}
+	tests := []struct {
+		name    string
+		params  containerParameters
+		wantSet bool
+	}{
+		{
+			name: "replication with embedded sentinel and sentinel password",
+			params: containerParameters{
+				Role: "replication", SentinelService: "my-replication-s-hl", SentinelMasterName: "mymaster",
+				SentinelPasswordSecret: sentinelSecret,
+			},
+			wantSet: true,
+		},
+		{
+			name: "replication with embedded sentinel without sentinel password",
+			params: containerParameters{
+				Role: "replication", SentinelService: "my-replication-s-hl", SentinelMasterName: "mymaster",
+			},
+		},
+		{
+			// No Sentinel service means no hook, so nothing reads the variable.
+			name:   "replication without sentinel",
+			params: containerParameters{Role: "replication", SentinelPasswordSecret: sentinelSecret},
+		},
+		{
+			name:   "cluster",
+			params: containerParameters{Role: "cluster", SentinelPasswordSecret: sentinelSecret},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.params.Image = "redis:latest"
+			containers := generateContainerDef("redis", tt.params, false, false, false, nil, nil, nil, nil)
+			require.NotEmpty(t, containers)
+			if tt.wantSet {
+				assert.Contains(t, containers[0].Env, wantEnv)
+				return
+			}
+			for _, env := range containers[0].Env {
+				assert.NotEqual(t, sentinelCLIAuthEnv, env.Name)
+			}
+		})
+	}
+}
+
+// TestSentinelCLIAuth runs sentinel_cli in a real shell against a fake
+// redis-cli that reports the REDISCLI_AUTH it was started with.
+func TestSentinelCLIAuth(t *testing.T) {
+	binDir := t.TempDir()
+	fakeCLI := `#!/bin/sh
+if [ -n "${REDISCLI_AUTH+x}" ]; then echo "auth=[$REDISCLI_AUTH]"; else echo "auth unset"; fi
+echo "args=$*"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "redis-cli"), []byte(fakeCLI), 0o755))
+
+	tests := []struct {
+		name     string
+		env      []string
+		wantAuth string
+	}{
+		{
+			// Distinct passwords: Sentinel must get its own, trimmed like REDISCLI_AUTH.
+			name:     "sentinel password replaces the redis password",
+			env:      []string{"REDISCLI_AUTH=redis-pass", sentinelCLIAuthEnv + "=sentinel-pass\n"},
+			wantAuth: "auth=[sentinel-pass]",
+		},
+		{
+			// A password-less Sentinel rejects any AUTH, so the Redis password must not leak through.
+			name:     "no sentinel password unsets the redis password",
+			env:      []string{"REDISCLI_AUTH=redis-pass"},
+			wantAuth: "auth unset",
+		},
+		{
+			name:     "empty sentinel password unsets the redis password",
+			env:      []string{"REDISCLI_AUTH=redis-pass", sentinelCLIAuthEnv + "="},
+			wantAuth: "auth unset",
+		},
+		{
+			name:     "no passwords at all",
+			wantAuth: "auth unset",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := sentinelCLIFunc + `
+sentinel_cli -h "svc" -p 26379 SENTINEL FAILOVER mymaster
+echo "outer=[${REDISCLI_AUTH:-}]"`
+			cmd := exec.CommandContext(t.Context(), "sh", "-c", script)
+			cmd.Env = append([]string{"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH")}, tt.env...)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			require.Len(t, lines, 3, string(out))
+			assert.Equal(t, tt.wantAuth, lines[0])
+			assert.Equal(t, "args=-h svc -p 26379 SENTINEL FAILOVER mymaster", lines[1])
+			// The local redis-cli calls after the failover still need the Redis password.
+			wantOuter := "outer=[]"
+			for _, kv := range tt.env {
+				if v, ok := strings.CutPrefix(kv, "REDISCLI_AUTH="); ok {
+					wantOuter = "outer=[" + v + "]"
+				}
+			}
+			assert.Equal(t, wantOuter, lines[2])
 		})
 	}
 }
@@ -2159,6 +2302,44 @@ func TestGenerateTLSEnvironmentVariables(t *testing.T) {
 		},
 	}
 	assert.ElementsMatch(t, envVars, expectedEnvVars, "EnvVars generated for TLS config are not as expected")
+}
+
+func TestGenerateSentinelTLSEnvironmentVariables(t *testing.T) {
+	tests := []struct {
+		name      string
+		tlsConfig *common.TLSConfig
+		want      []corev1.EnvVar
+	}{
+		{
+			name:      "explicit keys",
+			tlsConfig: &common.TLSConfig{CaCertFile: "test_ca.crt", CertKeyFile: "test_tls.crt", KeyFile: "test_tls.key"},
+			want: []corev1.EnvVar{
+				{Name: "TLS_MODE", Value: "true"},
+				{Name: "REDIS_TLS_CA_KEY", Value: "/tls/test_ca.crt"},
+				{Name: "REDIS_TLS_CA_CERT", Value: "/tls/test_ca.crt"},
+				{Name: "REDIS_TLS_CERT", Value: "/tls/test_tls.crt"},
+				{Name: "REDIS_TLS_CERT_KEY", Value: "/tls/test_tls.key"},
+			},
+		},
+		{
+			// Unlike the Redis pods, Sentinel always gets a CA path: the
+			// entrypoint writes it to tls-ca-cert-file unconditionally.
+			name:      "default keys still set the CA",
+			tlsConfig: &common.TLSConfig{},
+			want: []corev1.EnvVar{
+				{Name: "TLS_MODE", Value: "true"},
+				{Name: "REDIS_TLS_CA_KEY", Value: "/tls/ca.crt"},
+				{Name: "REDIS_TLS_CA_CERT", Value: "/tls/ca.crt"},
+				{Name: "REDIS_TLS_CERT", Value: "/tls/tls.crt"},
+				{Name: "REDIS_TLS_CERT_KEY", Value: "/tls/tls.key"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, GenerateSentinelTLSEnvironmentVariables(tt.tlsConfig))
+		})
+	}
 }
 
 func TestGenerateTLSEnvironmentVariables_NoExplicitCA(t *testing.T) {
